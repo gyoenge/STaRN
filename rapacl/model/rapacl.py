@@ -15,9 +15,6 @@ from rapacl.engines.trainer_utils import freeze_module
 import rapacl.configs.default.train as train
 
 
-NUM_SUB_COLS = [72, 54, 36]
-
-
 class MLPHead(nn.Module):
     def __init__(
         self,
@@ -202,22 +199,18 @@ def build_scratch_radiomics_model(device: torch.device):
     return build_radiomics_learner(
         checkpoint=None,
         numerical_columns=RADIOMICS_FEATURES_NAMES,
-        num_class=getattr(train, "NUM_CELLTYPE_CLASSES", 5),
+        num_class=train.NUM_CELLTYPE_CLASSES,
         hidden_dropout_prob=train.DROPOUT,
         projection_dim=train.PROJECTION_DIM,
         activation=train.ACTIVATION,
-        ape_drop_rate=getattr(train, "APE_DROP_RATE", 0.0),
+        ape_drop_rate=0.0,
         device=device,
-        num_sub_cols=getattr(train, "NUM_SUB_COLS", NUM_SUB_COLS),
+        num_sub_cols=train.NUM_SUB_COLS,
     ).to(device)
 
 
 def build_radiomics_model(device: torch.device):
-    rad_ckpt = getattr(
-        train,
-        "RAD_TRANSTAB_CHECKPOINT_PATH",
-        "/root/workspace/RaPaCL/checkpoints/radiomics_retrieval/transtab",
-    )
+    rad_ckpt = train.RADTRANSTAB_PRETRAINED_DIR
 
     if rad_ckpt is not None:
         print(f"[INFO] load rad TransTab checkpoint: {rad_ckpt}")
@@ -225,13 +218,13 @@ def build_radiomics_model(device: torch.device):
     model = build_radiomics_learner(
         checkpoint=None,
         numerical_columns=RADIOMICS_FEATURES_NAMES,
-        num_class=getattr(train, "NUM_CELLTYPE_CLASSES", 5),
+        num_class=train.NUM_CELLTYPE_CLASSES,
         hidden_dropout_prob=train.DROPOUT,
         projection_dim=train.PROJECTION_DIM,
         activation=train.ACTIVATION,
-        ape_drop_rate=getattr(train, "APE_DROP_RATE", 0.0),
+        ape_drop_rate=0.0,
         device=device,
-        num_sub_cols=getattr(train, "NUM_SUB_COLS", NUM_SUB_COLS),
+        num_sub_cols=train.NUM_SUB_COLS,
     ).to(device)
 
     if rad_ckpt is not None:
@@ -274,38 +267,38 @@ def build_model(
     radiomics_model = build_radiomics_model(device)
 
     pathomics_encoder = DenseNet121PathomicsEncoder(
-        out_dim=getattr(train, "PATHOMICS_DIM", 1024),
+        out_dim=train.PATHOMICS_DIM,
         pretrained=True,
     ).to(device)
 
     freeze_module(pathomics_encoder)
 
     pathomics_proj = MLPHead(
-        in_dim=getattr(train, "PATHOMICS_DIM", 1024),
+        in_dim=train.PATHOMICS_DIM,
         out_dim=train.PROJECTION_DIM,
-        hidden_dim=getattr(train, "PATH_PROJ_HIDDEN_DIM", 512),
-        dropout=getattr(train, "HEAD_DROPOUT", 0.1),
+        hidden_dim=train.PATH_PROJ_HIDDEN_DIM,
+        dropout=train.HEAD_DROPOUT,
     ).to(device)
 
     recon_head = MLPHead(
         in_dim=train.PROJECTION_DIM,
         out_dim=num_radiomics_features,
-        hidden_dim=getattr(train, "RECON_HIDDEN_DIM", 512),
-        dropout=getattr(train, "HEAD_DROPOUT", 0.1),
+        hidden_dim=train.RECON_HIDDEN_DIM,
+        dropout=train.HEAD_DROPOUT,
     ).to(device)
 
     cls_head = MLPHead(
-        in_dim=getattr(train, "HIDDEN_DIM", 128),
-        out_dim=getattr(train, "NUM_CELLTYPE_CLASSES", 5),
-        hidden_dim=getattr(train, "CLS_HIDDEN_DIM", 256),
-        dropout=getattr(train, "HEAD_DROPOUT", 0.1),
+        in_dim=train.HIDDEN_DIM,
+        out_dim=train.NUM_CELLTYPE_CLASSES,
+        hidden_dim=train.CLS_HIDDEN_DIM,
+        dropout=train.HEAD_DROPOUT,
     ).to(device)
 
     gene_head = MLPHead(
         in_dim=train.PROJECTION_DIM + train.PROJECTION_DIM,
         out_dim=num_genes,
-        hidden_dim=getattr(train, "GENE_HIDDEN_DIM", 512),
-        dropout=getattr(train, "HEAD_DROPOUT", 0.1),
+        hidden_dim=train.GENE_HIDDEN_DIM,
+        dropout=train.HEAD_DROPOUT,
     ).to(device)
 
     return MMCLReconClsModel(

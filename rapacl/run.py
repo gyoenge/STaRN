@@ -50,7 +50,7 @@ def main():
     )
 
     save_dir = os.path.join(
-        train.CHECKPOINT_PATH,
+        train.OUTPUT_CHECKPOINT_DIR,
         "rapacl_baseline",
     )
     os.makedirs(save_dir, exist_ok=True)

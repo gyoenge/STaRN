@@ -12,7 +12,7 @@ import torch.nn.init as nn_init
 import numpy as np
 import pandas as pd
 
-from rapacl.configs.default.train import CHECKPOINT_PATH
+from rapacl.configs.default.train import RADTRANSTAB_PRETRAINED_DIR
 import rapacl.configs.default.model_radtranstab as model_radtranstab
 
 
@@ -85,7 +85,7 @@ class TransTabFeatureExtractor:
             self.tokenizer = BertTokenizerFast.from_pretrained('./transtab/tokenizer')
         else:
             self.tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
-            self.tokenizer.save_pretrained(os.path.join(CHECKPOINT_PATH, 'tokenizer'))
+            self.tokenizer.save_pretrained(os.path.join(RADTRANSTAB_PRETRAINED_DIR, 'tokenizer'))
         self.tokenizer.__dict__['model_max_length'] = 512
         if disable_tokenizer_parallel: # disable tokenizer parallel
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
