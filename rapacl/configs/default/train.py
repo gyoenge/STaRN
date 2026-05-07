@@ -48,4 +48,5 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-2
 NUM_WORKERS = 0
 USE_AMP = False
+USE_TQDM = False
 

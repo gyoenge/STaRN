@@ -98,7 +98,7 @@ def train_contrastive_epoch(
         loader,
         desc="stage1_train",
         leave=False,
-        disable=not is_main_process(),
+        disable=(not is_main_process()) or (not train.USE_TQDM),
     )
 
     for batch in iterator:
