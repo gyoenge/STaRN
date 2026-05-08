@@ -42,28 +42,37 @@ def main():
         print(f"[INFO] world_size: {world_size}")
         print(f"[INFO] device: {device}")
 
-    trainset = build_dataset(train.TRAIN_SPLIT_CSV)
-    valset = build_dataset(train.VAL_SPLIT_CSV)
+    train_dataset = build_dataset(
+        train.TRAIN_SPLIT_CSV,
+        use_image_augmentation=train.USE_IMAGE_AUGMENTATION,
+    )
+
+    val_dataset = build_dataset(
+        train.VAL_SPLIT_CSV,
+        use_image_augmentation=False,
+    )
 
     train_loader, train_sampler = build_loader(
-        trainset,
+        train_dataset,
         shuffle=True,
-        drop_last=False,
+        drop_last=True,
         distributed=distributed,
+        pair_augment=train.USE_PAIR_AUGMENT_BATCH,
     )
 
     val_loader, val_sampler = build_loader(
-        valset,
+        val_dataset,
         shuffle=False,
         drop_last=False,
         distributed=distributed,
+        pair_augment=False,
     )
 
     if is_main_process():
-        print(f"[INFO] train samples: {len(trainset)}")
-        print(f"[INFO] val samples: {len(valset)}")
+        print(f"[INFO] train samples: {len(train_dataset)}")
+        print(f"[INFO] val samples: {len(val_dataset)}")
 
-    num_genes = len(trainset.genes)
+    num_genes = len(train_dataset.genes)
     num_radiomics_features = len(RADIOMICS_FEATURES_NAMES)
 
     if is_main_process():

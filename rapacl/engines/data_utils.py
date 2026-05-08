@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import json
+import math
 import os
-from typing import Optional, Any
+from typing import Optional, Any, Iterator
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torchvision import transforms as T
 from hest.bench.st_dataset import H5PatchDataset, load_adata
 
 import rapacl.configs.default.train as train
@@ -53,6 +56,28 @@ DEFAULT_DATASET_STRUCTURE = {
         "distribution_col": "target_distribution",
     },
 }
+
+
+def build_image_augmentation():
+    return T.Compose(
+        [
+            T.ToPILImage(),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.5),
+            T.RandomApply(
+                [
+                    T.ColorJitter(
+                        brightness=0.10,
+                        contrast=0.10,
+                        saturation=0.05,
+                        hue=0.02,
+                    )
+                ],
+                p=0.5,
+            ),
+            T.ToTensor(),
+        ]
+    )
 
 
 class HestRadiomicsDataset(torch.utils.data.Dataset):
@@ -331,13 +356,83 @@ class HestRadiomicsDataset(torch.utils.data.Dataset):
         return sample
 
 
-def build_dataset(split_csv_path: str):
+class DistributedPairAugmentBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        drop_last: bool = True,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        if batch_size % 2 != 0:
+            raise ValueError("batch_size must be even for pair augmentation.")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.group_size = batch_size // 2
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.num_samples = len(dataset)
+
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        if self.shuffle:
+            indices = torch.randperm(self.num_samples, generator=generator).tolist()
+        else:
+            indices = list(range(self.num_samples))
+
+        local_indices = indices[self.rank::self.world_size]
+
+        for start_idx in range(0, len(local_indices), self.group_size):
+            chunk = local_indices[start_idx:start_idx + self.group_size]
+
+            if len(chunk) < self.group_size and self.drop_last:
+                continue
+
+            batch_indices = []
+            for idx in chunk:
+                batch_indices.append(idx)
+                batch_indices.append(idx)
+
+            yield batch_indices
+
+    def __len__(self) -> int:
+        local_n = math.ceil(self.num_samples / self.world_size)
+
+        if self.drop_last:
+            return local_n // self.group_size
+
+        return math.ceil(local_n / self.group_size)
+
+
+def build_dataset(
+    split_csv_path: str,
+    use_image_augmentation: bool = False,
+):
+    transforms = build_image_augmentation() if use_image_augmentation else None
+
     return HestRadiomicsDataset(
         bench_data_root=train.ROOT_DIR,
         split_csv_path=split_csv_path,
         gene_list_path=train.GENE_LIST_PATH,
         feature_list_path=train.FEATURE_LIST_PATH,
         radiomics_dir=DEFAULT_DATASET_STRUCTURE["radiomics_data"]["dir"],
+        transforms=transforms,
     )
 
 
@@ -346,7 +441,26 @@ def build_loader(
     shuffle: bool,
     drop_last: bool = False,
     distributed: bool = False,
+    pair_augment: bool = False,
 ):
+    if pair_augment:
+        batch_sampler = DistributedPairAugmentBatchSampler(
+            dataset=dataset,
+            batch_size=train.BATCH_SIZE,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            seed=train.SEED,
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=train.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        return loader, batch_sampler
+
     sampler = None
 
     if distributed:
@@ -397,3 +511,5 @@ def get_target_label(
         f"target label key not found. "
         f"Available keys: {list(batch.keys())}"
     )
+
+

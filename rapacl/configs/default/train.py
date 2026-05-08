@@ -38,19 +38,22 @@ HEAD_DROPOUT = 0.1
 ### Loss Settings
 MMCL_LOSS = "multipos_nt_xent" # "symmetric_info_nce" | "multipos_nt_xent"
 
-CONTRASTIVE_TEMPERATURE = 0.2 # 0.07 | 0.15 ~ 0.3 
+CONTRASTIVE_TEMPERATURE = 0.25 # 0.07 | 0.15 ~ 0.3 
 
-MMCL_LAMBDA = 0.8 # 0.7 | 1.0 
+MMCL_LAMBDA = 0.6 # 0.7 | 1.0 
 RECON_LAMBDA = 3.0 # 3.0 | 1.0 
 CLS_LAMBDA = 1.0
 
 ### Train Settings 
 SEED = 0
 DEVICE = "cuda:0"
-BATCH_SIZE = 128
+BATCH_SIZE = 256 # 128
 NUM_WORKERS = 0
 USE_AMP = False
 USE_TQDM = False
+
+USE_IMAGE_AUGMENTATION = True
+USE_PAIR_AUGMENT_BATCH = True
 
 WARMUP_RECON_EPOCHS = 5
 MMCL_RAMPUP_EPOCHS = 15 # 10
