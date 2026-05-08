@@ -5,6 +5,7 @@ import json
 import math
 import os
 from typing import Optional, Any, Iterator
+from PIL import Image
 
 import random
 import numpy as np
@@ -60,12 +61,6 @@ DEFAULT_DATASET_STRUCTURE = {
 
 
 class HEStainAugmentation:
-    """
-    Simple H&E-like stain augmentation.
-    Input: PIL Image or numpy image
-    Output: numpy image or PIL-compatible image
-    """
-
     def __init__(
         self,
         alpha_range=(0.85, 1.15),
@@ -82,12 +77,12 @@ class HEStainAugmentation:
 
         img = np.array(img).astype(np.float32) / 255.0
 
-        # RGB channel-wise perturbation
         alpha = np.random.uniform(
             self.alpha_range[0],
             self.alpha_range[1],
             size=(1, 1, 3),
         )
+
         beta = np.random.uniform(
             self.beta_range[0],
             self.beta_range[1],
@@ -97,8 +92,10 @@ class HEStainAugmentation:
         img = img * alpha + beta
         img = np.clip(img, 0.0, 1.0)
 
-        return (img * 255).astype(np.uint8)
+        img = (img * 255).astype(np.uint8)
 
+        return Image.fromarray(img)
+    
 
 def build_image_augmentation():
     return T.Compose(
