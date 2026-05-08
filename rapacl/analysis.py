@@ -32,7 +32,7 @@ DEVICE = train.DEVICE
 MAX_GRADCAM_PER_GENE = 20
 ATTR_BATCHES_PER_FOLD = 20
 
-TARGET_GENE_INDEX_RANGE = (100, 119)
+TARGET_SAMPLE_INDICES = {103, 107, 112}
 
 def setup_logger(output_dir: str) -> logging.Logger:
     os.makedirs(output_dir, exist_ok=True)
@@ -72,46 +72,16 @@ def get_fold_split_paths(fold: int) -> tuple[str, str]:
     )
 
 
-# def get_gene_indices(genes: Iterable[str], target_genes: list[str]) -> dict[str, int]:
-#     genes = list(genes)
-#     gene_to_idx = {g: i for i, g in enumerate(genes)}
-
-#     result = {}
-#     for gene in target_genes:
-#         if gene in gene_to_idx:
-#             result[gene] = gene_to_idx[gene]
-#         else:
-#             print(f"[WARN] target gene not found in dataset gene list: {gene}")
-
-#     return result
-
-def get_gene_indices(
-    genes: Iterable[str],
-    target_genes: list[str],
-    target_index_range: tuple[int, int] | None = None,
-) -> dict[str, int]:
+def get_gene_indices(genes: Iterable[str], target_genes: list[str]) -> dict[str, int]:
     genes = list(genes)
     gene_to_idx = {g: i for i, g in enumerate(genes)}
 
     result = {}
-
-    # 1) gene name 기반 target
     for gene in target_genes:
         if gene in gene_to_idx:
             result[gene] = gene_to_idx[gene]
         else:
             print(f"[WARN] target gene not found in dataset gene list: {gene}")
-
-    # 2) index range 기반 target
-    if target_index_range is not None:
-        start_idx, end_idx = target_index_range
-
-        start_idx = max(start_idx, 0)
-        end_idx = min(end_idx, len(genes) - 1)
-
-        for idx in range(start_idx, end_idx + 1):
-            gene_name = genes[idx]
-            result[gene_name] = idx
 
     return result
 
@@ -566,6 +536,13 @@ def run_gradcam_for_fold(
                 )
 
                 for i in range(bs):
+
+                    sample_idx = batch_idx * bs + i
+
+                    if TARGET_SAMPLE_INDICES is not None:
+                        if sample_idx not in TARGET_SAMPLE_INDICES:
+                            continue
+                    
                     if saved_count[gene_name] >= MAX_GRADCAM_PER_GENE:
                         break
 
@@ -591,7 +568,7 @@ def run_gradcam_for_fold(
                     save_path = os.path.join(
                         save_dir,
                         gene_name,
-                        f"batch{batch_idx:04d}_idx{i:02d}_err{abs_error:.3f}.png",
+                        f"sample{sample_idx:05d}_err{abs_error:.3f}.png"
                     )
 
                     save_gradcam_figure(
@@ -653,7 +630,6 @@ def run_fold(fold: int, logger: logging.Logger):
     gene_indices = get_gene_indices(
         val_dataset.genes,
         TARGET_GENES,
-        target_index_range=TARGET_GENE_INDEX_RANGE,
     )
 
     logger.info(f"Target gene indices: {gene_indices}")
