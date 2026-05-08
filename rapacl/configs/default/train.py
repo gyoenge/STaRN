@@ -13,14 +13,10 @@ RADTRANSTAB_PRETRAINED_DIR = os.path.join(PROJECT_DIR, "checkpoints", "radiomics
 OUTPUT_CHECKPOINT_DIR = os.path.join(PROJECT_DIR, "checkpoints", "rapacl", "default")
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "outputs", "rapacl", "default")
 
-# LABEL_COL = "target_label"
-# ID_COL = "barcode"
-NUM_CELLTYPE_CLASSES = 5 
-
 ### Model Settings 
 # Radiomics TransTab Settings
 # commented out is same as default in build_radiomics_learner, so we can directly use the default values without passing them as arguments
-NUM_CLASS = NUM_CELLTYPE_CLASSES
+NUM_CLASS = NUM_CELLTYPE_CLASSES = 5
 HIDDEN_DIM = 128
 # NUM_LAYER = 2
 PROJECTION_DIM = 384
@@ -43,21 +39,21 @@ HEAD_DROPOUT = 0.1
 SEED = 0
 DEVICE = "cuda:0"
 BATCH_SIZE = 128
-LR = 1e-4
 NUM_WORKERS = 0
 USE_AMP = False
 USE_TQDM = False
 
 WARMUP_RECON_EPOCHS = 5
-MMCL_RAMPUP_EPOCHS = 10
-STAGE1_EPOCHS = 20 
+MMCL_RAMPUP_EPOCHS = 15 # 10
+STAGE1_EPOCHS = 25 # 20 
 STAGE2_EPOCHS = 50
 
-MMCL_LAMBDA = 0.7 # 0.7 | 1.0 
+MMCL_LAMBDA = 0.8 # 0.7 | 1.0 
 RECON_LAMBDA = 3.0 # 3.0 | 1.0 
 CLS_LAMBDA = 1.0
-CONTRASTIVE_TEMPERATURE = 0.15 # 0.07 | 0.15 ~ 0.3 
+CONTRASTIVE_TEMPERATURE = 0.2 # 0.07 | 0.15 ~ 0.3 
 
+LR = 1e-4
 GENE_LR = 1e-4
 PATH_PROJ_LR = 3e-5 # 1e-5 | 1e-4
 PATH_ENCODER_LR = 1e-4 # 1e-5 | 1e-4
