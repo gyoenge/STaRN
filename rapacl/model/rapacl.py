@@ -10,7 +10,7 @@ from torchvision import models
 
 from rapacl.configs.default.radiomics_columns import RADIOMICS_FEATURES_NAMES
 from rapacl.model.radtranstab.build import build_radiomics_learner
-from rapacl.model.patchenc import build_patch_encoder
+from rapacl.model.patchenc.build import build_patch_encoder
 from rapacl.engines.trainer_utils import freeze_module, is_main_process
 
 import rapacl.configs.default.train as train
