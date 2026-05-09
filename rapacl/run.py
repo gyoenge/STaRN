@@ -208,9 +208,9 @@ def main():
 
     fold_results = []
 
-    num_folds = train.NUM_FOLDS
+    selected_folds = train.SELECT_FOLDS
 
-    for fold in range(num_folds):
+    for fold in selected_folds:
         best_record = run_one_fold(
             fold=fold,
             distributed=distributed,

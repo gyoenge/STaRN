@@ -4,8 +4,8 @@ import os
 
 ROOT_DIR = os.path.join(os.path.expanduser("~"), "workspace", "datasets", "rapacl_data")
 FEATURE_LIST_PATH = os.path.join(ROOT_DIR, "feature_list.txt")
-GENE_LIST_PATH = os.path.join(ROOT_DIR, "var_250genes.json")
-NUM_FOLDS = 4 # 0~3 (for 4-fold CV)
+GENE_LIST_PATH = os.path.join(ROOT_DIR, "var_50genes.json")
+SELECT_FOLDS = [0, 1, 2, 3]  # for cross-validation fold selection: default 0~3 
 
 PROJECT_DIR = os.path.join(os.path.expanduser("~"), "workspace", "RaPaCL")
 RADTRANSTAB_PRETRAINED_DIR = os.path.join(PROJECT_DIR, "checkpoints", "radiomics_retrieval", "transtab")
