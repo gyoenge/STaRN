@@ -27,12 +27,12 @@ from rapacl.configs.default.radiomics_columns import RADIOMICS_FEATURES_NAMES
 import rapacl.configs.default.train as train
 
 
-FOLD = 0
+SELECT_FOLDS = [0, 1, 2, 3]
 PCA_DIM = 256
 RIDGE_ALPHAS = [0.1, 1.0, 10.0, 100.0]
-MLP_EPOCHS = 100
-MLP_LR = 1e-3
-MLP_WEIGHT_DECAY = 1e-4
+MLP_EPOCHS = 50
+MLP_LR = 1e-4 
+MLP_WEIGHT_DECAY = 1e-3
 BATCH_SIZE = 256
 
 
@@ -216,13 +216,44 @@ def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray):
     }
 
 
-def main():
-    set_seed(train.SEED)
+def summarize_all_folds(all_fold_results: list[dict]) -> dict:
+    methods = all_fold_results[0]["results"]
+    summary = []
 
-    device = torch.device(train.DEVICE if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] device: {device}")
+    for m_idx, method_result in enumerate(methods):
+        method_name = method_result["method"]
 
-    train_csv, val_csv = get_split_paths(FOLD)
+        pccs = [
+            fold_result["results"][m_idx]["gene_wise_pcc"]
+            for fold_result in all_fold_results
+        ]
+        mses = [
+            fold_result["results"][m_idx]["mse"]
+            for fold_result in all_fold_results
+        ]
+
+        summary.append(
+            {
+                "method": method_name,
+                "mean_pcc": float(np.mean(pccs)),
+                "std_pcc": float(np.std(pccs, ddof=1)) if len(pccs) > 1 else 0.0,
+                "mean_mse": float(np.mean(mses)),
+                "std_mse": float(np.std(mses, ddof=1)) if len(mses) > 1 else 0.0,
+                "fold_pccs": pccs,
+                "fold_mses": mses,
+            }
+        )
+
+    return {
+        "fold_results": all_fold_results,
+        "summary": summary,
+    }
+
+
+def run_one_fold(fold: int, device: torch.device) -> dict:
+    set_seed(train.SEED + fold * 100)
+
+    train_csv, val_csv = get_split_paths(fold)
 
     train_dataset = build_dataset(train_csv, use_image_augmentation=False)
     val_dataset = build_dataset(val_csv, use_image_augmentation=False)
@@ -245,7 +276,8 @@ def main():
     num_genes = len(train_dataset.genes)
     num_radiomics_features = len(RADIOMICS_FEATURES_NAMES)
 
-    print(f"[INFO] fold: {FOLD}")
+    print("\n" + "=" * 80)
+    print(f"[INFO] fold: {fold}")
     print(f"[INFO] train samples: {len(train_dataset)}")
     print(f"[INFO] val samples  : {len(val_dataset)}")
     print(f"[INFO] num_genes: {num_genes}")
@@ -257,15 +289,12 @@ def main():
         num_radiomics_features=num_radiomics_features,
     )
 
-    ckpt_path = get_ckpt_path(FOLD)
+    ckpt_path = get_ckpt_path(fold)
     print(f"[INFO] load checkpoint: {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
     state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-    state_dict = {
-        k.replace("module.", ""): v
-        for k, v in state_dict.items()
-    }
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"[INFO] missing keys: {missing}")
@@ -282,9 +311,6 @@ def main():
 
     results = []
 
-    # ------------------------------------------------------------
-    # 1. UNI -> PCA(256) -> Ridge Regression
-    # ------------------------------------------------------------
     scaler_uni = StandardScaler()
     x_train_uni = scaler_uni.fit_transform(train_feat["uni_raw"])
     x_val_uni = scaler_uni.transform(val_feat["uni_raw"])
@@ -299,17 +325,8 @@ def main():
     ridge.fit(x_train_pca, y_train)
     pred_ridge = ridge.predict(x_val_pca)
 
-    results.append(
-        evaluate(
-            "UNI_PCA256_Ridge",
-            y_val,
-            pred_ridge,
-        )
-    )
+    results.append(evaluate("UNI_PCA256_Ridge", y_val, pred_ridge))
 
-    # ------------------------------------------------------------
-    # 2. UNI -> PCA(256) -> MLP
-    # ------------------------------------------------------------
     scaler_pca = StandardScaler()
     x_train_pca_scaled = scaler_pca.fit_transform(x_train_pca)
     x_val_pca_scaled = scaler_pca.transform(x_val_pca)
@@ -322,31 +339,14 @@ def main():
         device,
     )
 
-    results.append(
-        evaluate(
-            "UNI_PCA256_MLP",
-            y_val,
-            pred_mlp_pca,
-        )
-    )
+    results.append(evaluate("UNI_PCA256_MLP", y_val, pred_mlp_pca))
 
-    # ------------------------------------------------------------
-    # 3. concat([UNI PCA256], [RaPaCL UNI proj], [RaPaCL RadTransTab proj]) -> MLP
-    # ------------------------------------------------------------
     x_train_concat = np.concatenate(
-        [
-            x_train_pca,
-            train_feat["path_proj"],
-            train_feat["rad_proj"],
-        ],
+        [x_train_pca, train_feat["path_proj"], train_feat["rad_proj"]],
         axis=1,
     )
     x_val_concat = np.concatenate(
-        [
-            x_val_pca,
-            val_feat["path_proj"],
-            val_feat["rad_proj"],
-        ],
+        [x_val_pca, val_feat["path_proj"], val_feat["rad_proj"]],
         axis=1,
     )
 
@@ -372,29 +372,56 @@ def main():
         )
     )
 
-    save_dir = Path(train.OUTPUT_CHECKPOINT_DIR) / "rapacl_uni_frozen" / f"fold_{FOLD}"
+    fold_result = {
+        "fold": fold,
+        "checkpoint": ckpt_path,
+        "pca_dim": PCA_DIM,
+        "results": results,
+    }
+
+    save_dir = Path(train.OUTPUT_CHECKPOINT_DIR) / "rapacl_uni_frozen" / f"fold_{fold}"
     save_path = save_dir / "uni_singlefold_ablation_result.json"
 
     with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "fold": FOLD,
-                "checkpoint": ckpt_path,
-                "pca_dim": PCA_DIM,
-                "results": results,
-            },
-            f,
-            indent=4,
-        )
+        json.dump(fold_result, f, indent=4)
+
+    print(f"[INFO][Fold {fold}] saved to: {save_path}")
+
+    del model, train_feat, val_feat
+    torch.cuda.empty_cache()
+
+    return fold_result
+
+
+def main():
+    device = torch.device(train.DEVICE if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] device: {device}")
+    print(f"[INFO] selected folds: {SELECT_FOLDS}")
+
+    all_fold_results = []
+
+    for fold in SELECT_FOLDS:
+        fold_result = run_one_fold(fold, device)
+        all_fold_results.append(fold_result)
+
+    final_result = summarize_all_folds(all_fold_results)
+
+    save_dir = Path(train.OUTPUT_CHECKPOINT_DIR) / "rapacl_uni_frozen"
+    save_path = save_dir / "uni_allfold_ablation_result.json"
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(final_result, f, indent=4)
 
     print("\n" + "=" * 80)
-    print("[FINAL SINGLE-FOLD ABLATION RESULT]")
-    for r in results:
+    print("[FINAL ALL-FOLD ABLATION RESULT]")
+
+    for r in final_result["summary"]:
         print(
             f"{r['method']} | "
-            f"PCC={r['gene_wise_pcc']:.4f} | "
-            f"MSE={r['mse']:.6f}"
+            f"PCC={r['mean_pcc']:.4f} ± {r['std_pcc']:.4f} | "
+            f"MSE={r['mean_mse']:.6f} ± {r['std_mse']:.6f}"
         )
+
     print(f"Saved to: {save_path}")
     print("=" * 80)
 
