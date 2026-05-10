@@ -298,6 +298,156 @@ def plot_2d_embedding(z, meta, title: str, save_path: str):
     plt.close()
 
 
+def get_block_level1(feature: str) -> str:
+    # morph 계열: morph_perimetersurfaceratio_maximum
+    if feature.startswith("morph_"):
+        parts = feature.split("_")
+        if len(parts) >= 2:
+            return "_".join(parts[:2])
+        return "morph"
+
+    # patch/cellseg 계열:
+    # patch_original_glszm_GrayLevelNonUniformity
+    # cellseg_all_original_firstorder_Energy
+    parts = feature.split("_")
+
+    if feature.startswith("patch_original_"):
+        return "_".join(parts[:3])
+
+    if feature.startswith("cellseg_all_original_"):
+        return "_".join(parts[:4])
+
+    return "other"
+
+
+def get_block_level2(feature: str) -> str:
+    if feature.startswith("patch_original_"):
+        return "patch_original"
+
+    if feature.startswith("cellseg_all_original_"):
+        return "cellseg_all_original"
+
+    if feature.startswith("morph_"):
+        return "morph"
+
+    return "other"
+
+
+def get_sorted_features_by_block(
+    features: list[str],
+    level: int = 1,
+) -> list[str]:
+    if level == 1:
+        key_fn = get_block_level1
+    elif level == 2:
+        key_fn = get_block_level2
+    else:
+        raise ValueError("level must be 1 or 2")
+
+    return sorted(features, key=lambda f: (key_fn(f), f))
+
+
+def plot_block_correlation_heatmap(
+    x: pd.DataFrame,
+    out_dir: str,
+    level: int = 1,
+    method: str = "pearson",
+):
+    if level == 1:
+        block_fn = get_block_level1
+    elif level == 2:
+        block_fn = get_block_level2
+    else:
+        raise ValueError("level must be 1 or 2")
+
+    sorted_features = get_sorted_features_by_block(
+        list(x.columns),
+        level=level,
+    )
+
+    x_sorted = x[sorted_features]
+    corr = x_sorted.corr(method=method).values
+
+    blocks = [block_fn(f) for f in sorted_features]
+
+    boundary_positions = []
+    block_centers = []
+    block_labels = []
+
+    start = 0
+    for i in range(1, len(blocks) + 1):
+        if i == len(blocks) or blocks[i] != blocks[start]:
+            end = i
+            boundary_positions.append(end - 0.5)
+            block_centers.append((start + end - 1) / 2)
+            block_labels.append(blocks[start])
+            start = i
+
+    plt.figure(figsize=(14, 12))
+    im = plt.imshow(
+        corr,
+        vmin=-1,
+        vmax=1,
+        cmap="coolwarm",
+        aspect="auto",
+    )
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+
+    for pos in boundary_positions[:-1]:
+        plt.axhline(pos, color="black", linewidth=0.8)
+        plt.axvline(pos, color="black", linewidth=0.8)
+
+    plt.xticks(
+        block_centers,
+        block_labels,
+        rotation=90,
+        fontsize=7,
+    )
+    plt.yticks(
+        block_centers,
+        block_labels,
+        fontsize=7,
+    )
+
+    plt.title(f"Block-wise Radiomics Correlation Heatmap - Level {level}")
+    plt.tight_layout()
+
+    save_path = os.path.join(
+        out_dir,
+        f"feature_correlation_block_level{level}.png",
+    )
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    corr_df = pd.DataFrame(
+        corr,
+        index=sorted_features,
+        columns=sorted_features,
+    )
+    corr_df.to_csv(
+        os.path.join(
+            out_dir,
+            f"feature_correlation_block_level{level}.csv",
+        )
+    )
+
+    block_df = pd.DataFrame(
+        {
+            "feature": sorted_features,
+            "block": blocks,
+        }
+    )
+    block_df.to_csv(
+        os.path.join(
+            out_dir,
+            f"feature_block_assignment_level{level}.csv",
+        ),
+        index=False,
+    )
+
+    print(f"[INFO] saved block correlation heatmap: {save_path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_dir", type=str, default=train.ROOT_DIR)
@@ -343,9 +493,28 @@ def main():
         header=["feature"],
     )
 
+    print("[INFO] plot_pca")
     plot_pca(x_scaled, meta, out_dir)
+
+    print("[INFO] plot_correlation")
     plot_correlation(x, out_dir)
+    print("[INFO] plot_block_correlation_heatmap level1")
+    plot_block_correlation_heatmap(
+        x=x,
+        out_dir=out_dir,
+        level=1,
+    )
+    print("[INFO] plot_block_correlation_heatmap level2")
+    plot_block_correlation_heatmap(
+        x=x,
+        out_dir=out_dir,
+        level=2,
+    )
+
+    print("[INFO] plot_tsne")
     plot_tsne(x_scaled, meta, out_dir, max_samples=args.max_samples)
+
+    print("[INFO] plot_umap")
     plot_umap(x_scaled, meta, out_dir, max_samples=args.max_samples)
 
     print("[INFO] Done.")
