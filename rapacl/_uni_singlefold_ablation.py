@@ -91,23 +91,8 @@ def extract_features(model, loader, device):
         path_proj = model.pathomics_proj(uni_raw)
 
         # 3) RaPaCL radiomics projection
-        rad_out = model.radiomics_model(radiomics)
-
-        if isinstance(rad_out, dict):
-            rad_proj = (
-                rad_out.get("contrastive")
-                or rad_out.get("z")
-                or rad_out.get("proj")
-                or rad_out.get("embedding")
-            )
-        elif isinstance(rad_out, (tuple, list)):
-            # 일반적으로 contrastive/projection embedding이 앞쪽에 있다고 가정
-            rad_proj = rad_out[0]
-        else:
-            rad_proj = rad_out
-
-        if rad_proj is None:
-            raise RuntimeError("Could not infer radiomics projection from radiomics_model output.")
+        rad = model.encode_radiomics(radiomics)
+        rad_proj = rad["rad_contrast_z"]
 
         uni_raw_list.append(uni_raw.detach().cpu().numpy())
         path_proj_list.append(path_proj.detach().cpu().numpy())
