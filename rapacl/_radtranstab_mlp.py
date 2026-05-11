@@ -60,6 +60,12 @@ class RadiomicsTransTabEncoder(nn.Module):
 
         out = self.encoder(radiomics_df)
 
+        def select_token(feat: torch.Tensor) -> torch.Tensor:
+            # [B, T, D] -> [B, D]
+            if feat.ndim == 3:
+                feat = feat[:, 0]  # 또는 feat.mean(dim=1)
+            return feat.to(self.device)
+
         if isinstance(out, dict):
             for key in [
                 "contrastive_feat",
@@ -69,7 +75,7 @@ class RadiomicsTransTabEncoder(nn.Module):
                 "feat",
             ]:
                 if key in out:
-                    return out[key].to(self.device)
+                    return select_token(out[key])
 
             raise KeyError(
                 f"Cannot find feature key in encoder output. "
@@ -77,9 +83,9 @@ class RadiomicsTransTabEncoder(nn.Module):
             )
 
         if isinstance(out, tuple):
-            return out[0].to(self.device)
+            return select_token(out[0])
 
-        return out.to(self.device)
+        return select_token(out)
 
 
 class RadiomicsTransTabMLPGeneModel(nn.Module):
@@ -353,11 +359,7 @@ def run_one_fold(
     best_record = None
     best_pcc = -1e9
 
-    max_epochs = (
-        train.STAGE2_EPOCHS
-        if hasattr(train, "STAGE2_EPOCHS")
-        else train.MAX_EPOCHS
-    )
+    max_epochs = train.STAGE2_EPOCHS
 
     for epoch in range(max_epochs):
         train_loss = train_one_epoch(
