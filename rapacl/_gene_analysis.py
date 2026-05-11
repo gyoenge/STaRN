@@ -1,5 +1,6 @@
 # python -m rapacl._gene_analysis --model_type rapacl --folds 0,1,2,3
 # python -m rapacl._gene_analysis --model_type uni_mlp --folds 0,1,2,3
+# python -m rapacl._gene_analysis --model_type densenet_mlp --folds 0,1,2,3
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from rapacl.engines.data_utils import build_dataset, build_loader, DEFAULT_DATAS
 from rapacl.model.rapacl import build_model
 from rapacl.model.rapacl_uni import build_uni_model
 from rapacl._uni_mlp import build_uni_mlp_model
+from rapacl._densenet_mlp import build_densenet_mlp_model
 from rapacl.configs.default.radiomics_columns import RADIOMICS_FEATURES_NAMES
 
 import rapacl.configs.default.train as train
@@ -34,6 +36,9 @@ PLOT_SPOT_SIZE = 3 # 0.5 (TENX99 fit) # 3 (others)
 def get_experiment_name(model_type: str = "rapacl") -> str:
     if model_type == "uni_mlp":
         return "uni_frozen_mlp"
+
+    if model_type == "densenet_mlp":
+        return "densenet121_mlp"
 
     backbone = train.BACKBONE.lower().strip()
     return "rapacl_uni_frozen" if backbone == "uni" else f"rapacl_{backbone}"
@@ -104,6 +109,12 @@ def build_eval_model(
 ):
     if model_type == "uni_mlp":
         return build_uni_mlp_model(
+            device=device,
+            num_genes=num_genes,
+        )
+
+    if model_type == "densenet_mlp":
+        return build_densenet_mlp_model(
             device=device,
             num_genes=num_genes,
         )
@@ -776,7 +787,7 @@ def main():
         "--model_type",
         type=str,
         default="rapacl",
-        choices=["rapacl", "uni_mlp"],
+        choices=["rapacl", "uni_mlp", "densenet_mlp"],
     )
     args = parser.parse_args()
 
