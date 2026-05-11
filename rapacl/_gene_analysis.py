@@ -1,4 +1,4 @@
-# python -m rapacl.gene_analysis --folds 0,1,2,3 
+# python -m rapacl._gene_analysis --folds 0,1,2,3 
 
 from __future__ import annotations
 
@@ -264,7 +264,11 @@ def run_one_fold_analysis(fold: int, device: torch.device, checkpoint_path: str 
 
     model = build_eval_model(device=device, num_genes=num_genes)
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
     state_dict = strip_module_prefix(unwrap_state_dict(ckpt))
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
