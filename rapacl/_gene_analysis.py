@@ -1,6 +1,7 @@
 # python -m rapacl._gene_analysis --model_type rapacl --folds 0,1,2,3
 # python -m rapacl._gene_analysis --model_type uni_mlp --folds 0,1,2,3
 # python -m rapacl._gene_analysis --model_type densenet_mlp --folds 0,1,2,3
+# python -m rapacl._gene_analysis --model_type radtranstab_mlp --folds 0,1,2,3
 
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from rapacl.model.rapacl import build_model
 from rapacl.model.rapacl_uni import build_uni_model
 from rapacl._uni_mlp import build_uni_mlp_model
 from rapacl._densenet_mlp import build_densenet_mlp_model
+from rapacl._radtranstab_mlp import build_radtranstab_mlp_model
 from rapacl.configs.default.radiomics_columns import RADIOMICS_FEATURES_NAMES
 
 import rapacl.configs.default.train as train
@@ -39,6 +41,9 @@ def get_experiment_name(model_type: str = "rapacl") -> str:
 
     if model_type == "densenet_mlp":
         return "densenet121_mlp"
+
+    if model_type == "radtranstab_mlp":
+        return "radtranstab_mlp"
 
     backbone = train.BACKBONE.lower().strip()
     return "rapacl_uni_frozen" if backbone == "uni" else f"rapacl_{backbone}"
@@ -68,6 +73,7 @@ def strip_module_prefix(state_dict: dict) -> dict:
 
 def find_best_stage2_checkpoint(save_dir: str) -> str:
     candidates = [
+        "best_radtranstab_mlp.pt",
         "best_uni_mlp.pt",
         "best_densenet121_mlp.pt",
         "best_stage2_genepred.pt",
@@ -106,6 +112,7 @@ def build_eval_model(
     device: torch.device,
     num_genes: int,
     model_type: str = "rapacl",
+    feature_cols: list[str] | None = None,
 ):
     if model_type == "uni_mlp":
         return build_uni_mlp_model(
@@ -117,6 +124,14 @@ def build_eval_model(
         return build_densenet_mlp_model(
             device=device,
             num_genes=num_genes,
+        )
+
+    if model_type == "radtranstab_mlp":
+        assert feature_cols is not None
+        return build_radtranstab_mlp_model(
+            device=device,
+            num_genes=num_genes,
+            feature_cols=feature_cols,
         )
 
     backbone = train.BACKBONE.lower().strip()
@@ -163,7 +178,7 @@ def get_prediction_from_output(output):
 
 
 @torch.no_grad()
-def predict_gene_expression(model, loader, device: torch.device):
+def predict_gene_expression(model, loader, device: torch.device, model_type: str = "rapacl"):
     model.eval()
 
     all_preds = []
@@ -175,12 +190,16 @@ def predict_gene_expression(model, loader, device: torch.device):
         radiomics = batch["radiomics"].to(device, non_blocking=True).float()
         target = batch["gene"].to(device, non_blocking=True).float()
 
-        if hasattr(model, "forward_gene"):
+        if model_type == "radtranstab_mlp":
+            pred = model(radiomics)
+
+        elif hasattr(model, "forward_gene"):
             output = model.forward_gene(
                 image=image,
                 radiomics=radiomics,
             )
             pred = output["pred_gene"]
+
         else:
             pred = model(image)
 
@@ -704,6 +723,7 @@ def run_one_fold_analysis(
         device=device,
         num_genes=num_genes,
         model_type=model_type,
+        feature_cols=val_dataset.feature_cols,
     )
 
     ckpt = torch.load(
@@ -722,7 +742,12 @@ def run_one_fold_analysis(
     assert len(unexpected) == 0
     assert len(missing) == 0
 
-    preds, targets, meta = predict_gene_expression(model, val_loader, device)
+    preds, targets, meta = predict_gene_expression(
+        model,
+        val_loader,
+        device,
+        model_type=model_type,
+    )
 
     fold_out_dir = os.path.join(train.OUTPUT_DIR, exp_name, "gene_analysis", f"fold_{fold}")
     os.makedirs(fold_out_dir, exist_ok=True)
@@ -787,7 +812,7 @@ def main():
         "--model_type",
         type=str,
         default="rapacl",
-        choices=["rapacl", "uni_mlp", "densenet_mlp"],
+        choices=["rapacl", "uni_mlp", "densenet_mlp", "radtranstab_mlp"],
     )
     args = parser.parse_args()
 
