@@ -20,7 +20,7 @@ from baselines.stnet.trainer import (
 )
 from baselines.common.config import apply_cli_overrides, load_yaml, parse_common_args
 from baselines.common.logger import setup_logger
-from baselines.common.utils import ensure_dir, save_yaml, seed_everything
+from baselines.common.utils import ensure_dir, get_device, save_yaml, seed_everything
 
 
 def print_config(cfg: dict[str, Any], logger) -> None:
@@ -28,13 +28,6 @@ def print_config(cfg: dict[str, Any], logger) -> None:
     for section, value in cfg.items():
         logger.info("%s: %s", section, value)
     logger.info("============================")
-
-
-def get_device(runtime_cfg: dict[str, Any]) -> torch.device:
-    requested = runtime_cfg.get("device", "cuda")
-    if isinstance(requested, str) and requested.startswith("cuda") and torch.cuda.is_available():
-        return torch.device(requested)
-    return torch.device("cpu")
 
 
 def resolve_gene_list_path(paths_cfg: dict[str, Any], model_cfg: dict[str, Any]) -> Path:
@@ -53,7 +46,6 @@ def resolve_split_path(
     outer_fold: int | None = None,
 ) -> Path:
     """
-    split_kind: 'train' or 'test'
     priority:
     1) paths.<split_kind>_split_csv
     2) {bench_data_root}/splits/{split_kind}_{outer_fold}.csv
@@ -69,34 +61,6 @@ def resolve_split_path(
 
     bench_data_root = Path(paths_cfg["bench_data_root"])
     return bench_data_root / "splits" / f"{split_kind}_{outer_fold}.csv"
-
-
-def create_dataset(
-    bench_data_root: str,
-    gene_list_path: str,
-    split_csv_path: str,
-    transforms=None,
-) -> STNetDataset:
-    return STNetDataset(
-        bench_data_root=bench_data_root,
-        gene_list_path=gene_list_path,
-        split_csv_path=split_csv_path,
-        transforms=transforms,
-    )
-
-
-def create_loader(
-    dataset,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-) -> DataLoader:
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-    )
 
 
 def save_model_checkpoint(model: torch.nn.Module, save_path: Path, logger) -> None:
@@ -142,13 +106,13 @@ def run_train_mode(
     logger.info("Train split: %s", train_split_path)
     logger.info("Gene list path: %s", gene_list_path)
 
-    train_dataset = create_dataset(
+    train_dataset = STNetDataset(
         bench_data_root=bench_data_root,
         gene_list_path=str(gene_list_path),
         split_csv_path=str(train_split_path),
         transforms=None,
     )
-    train_loader = create_loader(
+    train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
@@ -182,13 +146,13 @@ def run_train_mode(
         }
 
         if test_split_path is not None:
-            test_dataset = create_dataset(
+            test_dataset = STNetDataset(
                 bench_data_root=bench_data_root,
                 gene_list_path=str(gene_list_path),
                 split_csv_path=str(test_split_path),
                 transforms=None,
             )
-            test_loader = create_loader(
+            test_loader = DataLoader(
                 test_dataset,
                 batch_size=batch_size,
                 shuffle=False,
@@ -266,13 +230,13 @@ def run_eval_mode(
     model = build_model(model_cfg).to(device)
     load_model_checkpoint(model, checkpoint_path, device, logger)
 
-    test_dataset = create_dataset(
+    test_dataset = STNetDataset(
         bench_data_root=bench_data_root,
         gene_list_path=str(gene_list_path),
         split_csv_path=str(test_split_path),
         transforms=None,
     )
-    test_loader = create_loader(
+    test_loader = DataLoader(
         test_dataset,
         batch_size=train_cfg.get("batch_size", 32),
         shuffle=False,
@@ -396,7 +360,7 @@ def run_tuning_mode(
             split_df=outer_test_df,
             transforms=None,
         )
-        outer_test_loader = create_loader(
+        outer_test_loader = DataLoader(
             outer_test_dataset,
             batch_size=train_cfg.get("batch_size", 32),
             shuffle=False,

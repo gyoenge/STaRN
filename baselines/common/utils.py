@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 from pathlib import Path
@@ -36,3 +37,23 @@ def save_yaml(data: dict[str, Any], save_path: str | Path) -> None:
 
     with open(save_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+
+def load_gene_names(gene_list_path: str | Path) -> list[str]:
+    with open(gene_list_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        for key in ("genes", "gene_names", "var_genes"):
+            if key in data:
+                return list(data[key])
+        raise ValueError(f"Unrecognized gene list keys: {list(data.keys())}")
+    if isinstance(data, list):
+        return list(data)
+    raise ValueError(f"Unsupported gene list format: {gene_list_path}")
+
+
+def get_device(runtime_cfg: dict) -> torch.device:
+    requested = runtime_cfg.get("device", "cuda")
+    if str(requested).startswith("cuda") and torch.cuda.is_available():
+        return torch.device(requested)
+    return torch.device("cpu")

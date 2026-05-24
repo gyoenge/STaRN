@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from scipy.stats import pearsonr
 from sklearn.model_selection import LeaveOneOut
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
+from baselines.common.metrics import compute_genewise_pcc
 from .dataset import STNetDataset
 from .stnet import build_model
 
@@ -120,13 +118,7 @@ def eval_fold(
     all_preds = np.concatenate(all_preds, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
 
-    pearson_corrs = []
-    for gene_idx in range(all_targets.shape[1]):
-        corr, _ = pearsonr(all_targets[:, gene_idx], all_preds[:, gene_idx])
-        pearson_corrs.append(0.0 if np.isnan(corr) else float(corr))
-
-    mean_pearson = float(np.mean(pearson_corrs))
-    return mean_pearson, pearson_corrs
+    return compute_genewise_pcc(all_targets, all_preds)
 
 
 def select_best_epoch(
@@ -137,7 +129,7 @@ def select_best_epoch(
     num_genes: int,
     pretrained: bool = True,
     max_epochs: int = 50,
-    n_inner_folds: int = 4,  # 현재는 LOO 구조 유지
+    n_inner_folds: int = 4,
     batch_size: int = 32,
     num_workers: int = 0,
     seed: int = 42,
@@ -145,19 +137,12 @@ def select_best_epoch(
     lr: float = 1e-5,
     weight_decay: float = 0.0,
     momentum: float = 0.9,
-    logger: Optional[object] = None,
+    logger=None,
 ):
     """
-    Split outer-train into inner folds and pick the epoch with the best
+    Split outer-train into inner LOO folds and pick the epoch with the best
     mean validation Pearson correlation.
-
-    Note:
-        The original code uses LeaveOneOut() regardless of n_inner_folds.
-        To preserve behavior, this function also keeps LOO.
     """
-    _ = seed
-    _ = n_inner_folds
-
     loo = LeaveOneOut()
     fold_indices = list(loo.split(train_df))
     epoch_scores = {epoch: [] for epoch in range(1, max_epochs + 1)}
@@ -195,11 +180,11 @@ def select_best_epoch(
             num_workers=num_workers,
         )
 
-        model = build_model(
-            num_genes=num_genes,
-            pretrained=pretrained,
-            backbone_name="densenet121",
-        ).to(device)
+        model = build_model({
+            "num_genes": num_genes,
+            "pretrained": pretrained,
+            "backbone": "densenet121",
+        }).to(device)
 
         criterion = nn.MSELoss()
         optimizer = build_optimizer(
@@ -269,7 +254,7 @@ def retrain_full_train(
     lr: float = 1e-5,
     weight_decay: float = 0.0,
     momentum: float = 0.9,
-    logger: Optional[object] = None,
+    logger=None,
 ):
     full_train_dataset = STNetDataset(
         bench_data_root=bench_data_root,

@@ -29,10 +29,11 @@ from scipy.stats import pearsonr
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from baselines.common.config import apply_cli_overrides, load_yaml, parse_common_args
-from baselines.common.utils import seed_everything
+from baselines.common.config import load_yaml
+from baselines.common.utils import get_device, load_gene_names, seed_everything
 from baselines.stnet import build_model
 from baselines.stnet.dataset import STNetDataset
+from baselines.stnet.run import resolve_gene_list_path, resolve_split_path
 
 
 TARGET_GENES = [
@@ -45,35 +46,6 @@ TARGET_GENES = [
 ]
 
 PLOT_SPOT_SIZE = 3
-
-
-def get_device(runtime_cfg: dict[str, Any]) -> torch.device:
-    requested = runtime_cfg.get("device", "cuda")
-    if isinstance(requested, str) and requested.startswith("cuda") and torch.cuda.is_available():
-        return torch.device(requested)
-    return torch.device("cpu")
-
-
-def resolve_gene_list_path(paths_cfg: dict[str, Any], model_cfg: dict[str, Any]) -> Path:
-    if paths_cfg.get("gene_list_path"):
-        return Path(paths_cfg["gene_list_path"])
-
-    bench_data_root = Path(paths_cfg["bench_data_root"])
-    genes_criteria = model_cfg.get("genes_criteria", "var")
-    num_genes = model_cfg.get("num_genes", 250)
-    return bench_data_root / f"{genes_criteria}_{num_genes}genes.json"
-
-
-def resolve_split_path(
-    paths_cfg: dict[str, Any],
-    split_kind: str,
-    outer_fold: int,
-) -> Path:
-    direct_key = f"{split_kind}_split_csv"
-    if paths_cfg.get(direct_key):
-        return Path(paths_cfg[direct_key])
-
-    return Path(paths_cfg["bench_data_root"]) / "splits" / f"{split_kind}_{outer_fold}.csv"
 
 
 def create_loader(dataset, batch_size: int, num_workers: int) -> DataLoader:
@@ -117,19 +89,6 @@ def find_best_stnet_checkpoint(ckpt_dir: Path, fold: int | None = None) -> Path:
         return pt_files[-1]
 
     raise FileNotFoundError(f"No STNet checkpoint found in: {ckpt_dir}")
-
-
-def load_genes(gene_list_path: Path) -> list[str]:
-    with open(gene_list_path, "r", encoding="utf-8") as f:
-        genes = json.load(f)
-
-    if isinstance(genes, dict):
-        for key in ["genes", "gene_names", "var_genes"]:
-            if key in genes:
-                return list(genes[key])
-        raise ValueError(f"Unknown gene json format: keys={list(genes.keys())}")
-
-    return list(genes)
 
 
 def get_prediction_from_output(output):
@@ -625,7 +584,7 @@ def run_one_fold_analysis(
     gene_list_path = resolve_gene_list_path(paths_cfg, model_cfg)
     test_split_path = resolve_split_path(paths_cfg, "test", outer_fold=fold)
 
-    genes = load_genes(gene_list_path)
+    genes = load_gene_names(gene_list_path)
     model_cfg["num_genes"] = len(genes)
 
     print("=" * 80)

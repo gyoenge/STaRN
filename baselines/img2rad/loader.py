@@ -15,19 +15,8 @@ from .dataset import (
 
 
 def build_transforms():
-    train_transform = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.ToTensor(),
-        ]
-    )
-    eval_transform = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.ToTensor(),
-        ]
-    )
-    return train_transform, eval_transform
+    t = transforms.Compose([transforms.ToPILImage(), transforms.ToTensor()])
+    return t, t
 
 
 def build_fold_csv_paths(bench_data_root: str, outer_fold: int):
@@ -67,14 +56,14 @@ def _build_base_st_datasets(
         bench_data_root=bench_data_root,
         gene_list_path=gene_list_path,
         split_csv_path=train_csv,
-        transforms_=train_transform,
+        transforms=train_transform,
         normalize_expression=normalize_expression,
     )
     test_base_dataset = STNetDataset(
         bench_data_root=bench_data_root,
         gene_list_path=gene_list_path,
         split_csv_path=test_csv,
-        transforms_=eval_transform,
+        transforms=eval_transform,
         normalize_expression=normalize_expression,
     )
 

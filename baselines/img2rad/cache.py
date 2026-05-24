@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Dict, List, Tuple
@@ -10,22 +9,6 @@ import pandas as pd
 import torch
 
 from .dataset import STNetDataset
-
-
-def safe_load_gene_names(gene_list_path: str) -> List[str]:
-    with open(gene_list_path, "r", encoding="utf-8") as f:
-        gene_info = json.load(f)
-
-    if isinstance(gene_info, dict):
-        if "genes" in gene_info:
-            return gene_info["genes"]
-        if "gene_names" in gene_info:
-            return gene_info["gene_names"]
-
-    if isinstance(gene_info, list):
-        return gene_info
-
-    raise ValueError(f"Unsupported gene list format: {gene_list_path}")
 
 
 def _get_radiomics_logging_cfg(cfg: dict | None = None) -> dict:
@@ -70,66 +53,27 @@ def load_sample_radiomics_parquet(
         raise ValueError(
             f"Key column '{key_column}' not found in parquet: {parquet_path}. "
             f"Available columns: {list(df.columns)}"
-            )
-            
-    # 1) 제외 컬럼 제거
+        )
+
     ignore_columns = set(ignore_columns or [])
     ignore_prefixes = tuple(ignore_prefixes or [])
     ignore_columns.add(key_column)
-    candidate_cols = [
-        col for col in df.columns
-        if col not in ignore_columns
-        and not col.startswith(ignore_prefixes)
-    ]   
-
-    # 기존: numeric 전체 선택
-    # 2) 숫자형 컬럼만 feature로 사용
-    # numeric_cols = df[candidate_cols].select_dtypes(include=["number"]).columns.tolist()
-    # feature_columns = numeric_cols
-    # if not feature_columns:
-    #     raise ValueError(
-    #         f"No numeric feature columns found in parquet: {parquet_path}. "
-    #         f"candidate_cols={candidate_cols[:20]}"
-    #     )
-
-    # 수정: radiomics prefix만 선택 
-    # valid_prefixes = (
-    #     "original_",
-    #     "squareroot_",
-    #     "logarithm_",
-    #     "wavelet-",
-    #     "exponential_",
-    #     "square_",
-    #     "log-sigma-",
-    # )
 
     data_cfg = (cfg or {}).get("data", {})
-    valid_prefixes = tuple(
-        data_cfg.get(
-            "radiomics_valid_prefixes",
-            ["original_"],  
-        )
-    )
-    if logger is not None and log_cfg["enabled"]:
-        logger.info(
-            "[RadiomicsParquet] using valid_prefixes: %s",
-            valid_prefixes,
-        )
+    valid_prefixes = tuple(data_cfg.get("radiomics_valid_prefixes", ["original_"]))
 
-    feature_columns = [
-        col for col in df.columns
-        if col.startswith(valid_prefixes)
-    ]
+    if logger is not None and log_cfg["enabled"]:
+        logger.info("[RadiomicsParquet] using valid_prefixes: %s", valid_prefixes)
+
+    feature_columns = [col for col in df.columns if col.startswith(valid_prefixes)]
     if not feature_columns:
         raise ValueError(f"No valid radiomics features found in {parquet_path}")
 
-    # 디버깅용
     ignored_by_name = [col for col in df.columns if col in ignore_columns]
     ignored_by_prefix = [
         col for col in df.columns
         if col not in ignore_columns and col.startswith(ignore_prefixes)
     ]
-    # non_numeric_cols = [col for col in candidate_cols if col not in numeric_cols]
 
     if logger is not None and log_cfg["enabled"]:
         if ignored_by_name and log_cfg["log_ignored_by_name"]:
@@ -138,27 +82,16 @@ def load_sample_radiomics_parquet(
                 parquet_path,
                 ignored_by_name[:max_items],
             )
-
         if ignored_by_prefix and log_cfg["log_ignored_by_prefix"]:
             logger.info(
                 "[RadiomicsParquet] ignored by prefix in %s: %s",
                 parquet_path,
                 ignored_by_prefix[:max_items],
             )
-
-        # if non_numeric_cols and log_cfg["log_non_numeric_columns"]:
-        #     logger.warning(
-        #         "[RadiomicsParquet] non-numeric columns excluded in %s: %s",
-        #         parquet_path,
-        #         non_numeric_cols[:max_items],
-        #     )
-
         logger.info(
             "[RadiomicsParquet] filtered radiomics features: %d",
             len(feature_columns),
         )
-
-    ### 
 
     df = df.copy()
     df[key_column] = df[key_column].astype(str)
@@ -239,8 +172,6 @@ def load_samplewise_radiomics_targets(
         if barcode not in sample_df.index:
             missing_rows.append((idx, sample_id, barcode))
             continue
-
-        # feat = sample_df.loc[barcode, global_feature_names].to_numpy(dtype=np.float32)
 
         row = sample_df.loc[barcode, global_feature_names]
         feat = pd.to_numeric(row, errors="coerce").to_numpy(dtype=np.float32)

@@ -5,11 +5,11 @@ from pathlib import Path
 
 import torch
 
-from src.baselines.img2rad.evaluator import run_all_folds_pcc_eval
-from src.baselines.img2rad.trainer import run_all_folds_training
-from src.common.config import apply_cli_overrides, load_yaml, parse_common_args
-from src.common.logger import setup_logger
-from src.common.utils import ensure_dir, save_yaml, seed_everything
+from baselines.img2rad.evaluator import run_all_folds_pcc_eval
+from baselines.img2rad.trainer import run_all_folds_training
+from baselines.common.config import apply_cli_overrides, load_yaml, parse_common_args
+from baselines.common.logger import setup_logger
+from baselines.common.utils import ensure_dir, save_yaml, seed_everything
 
 
 def build_gene_list_path(cfg: dict) -> str:

@@ -8,24 +8,12 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from .cache import safe_load_gene_names
+from baselines.common.metrics import compute_genewise_pcc
+from baselines.common.utils import load_gene_names
 from .engine import predict_all
 from .loader import build_test_loader
-from .metrics import compute_genewise_pcc
 from .model import FusionGeneModel, ImgToRadiomicsModel
-
-
-def _build_gene_ckpt_name(fusion_mode: str, outer_fold: int) -> str:
-    if fusion_mode == "img_radpred":
-        tag = "imgfeat_radpred_gene"
-    elif fusion_mode == "img_radhidden":
-        tag = "imgfeat_radhidden_gene"
-    elif fusion_mode == "img_rawrad":
-        tag = "imgfeat_rawrad_gene"
-    else:
-        raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
-
-    return f"{tag}_best_fold{outer_fold}.pth"
+from .trainer import _build_gene_ckpt_name
 
 
 def build_model_and_load(
@@ -137,7 +125,7 @@ def evaluate_one_fold(
     fold_dir = os.path.join(save_dir, f"fold_{outer_fold}")
     os.makedirs(fold_dir, exist_ok=True)
 
-    gene_names = safe_load_gene_names(gene_list_path)
+    gene_names = load_gene_names(gene_list_path)
     per_gene_rows = []
     for idx, pcc in enumerate(gene_pccs):
         gene_name = gene_names[idx] if idx < len(gene_names) else f"gene_{idx}"
@@ -219,7 +207,7 @@ def aggregate_fold_results(
     std_mean_pcc = float(np.std([x["mean_pcc"] for x in fold_rows]))
     pooled_mean_pcc, pooled_gene_pccs = compute_genewise_pcc(all_targets, all_preds)
 
-    pooled_gene_names = safe_load_gene_names(gene_list_path)
+    pooled_gene_names = load_gene_names(gene_list_path)
 
     aggregate_per_gene_rows = []
     for idx, pooled_pcc in enumerate(pooled_gene_pccs):
