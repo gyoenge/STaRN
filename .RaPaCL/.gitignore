@@ -1,0 +1,50 @@
+
+####
+
+
+# checkpoints
+./*/checkpoints/
+./*/checkpoints/*
+*.pth
+
+# logs
+logs/
+logs/*
+*/logs/
+*/logs/*
+*.log 
+
+# results
+outputs/
+outputs/*
+*/outputs/
+*/outputs/*
+*.csv 
+selected_results/
+selected_results/*
+*/selected_results/
+*/selected_results/* 
+src/rapacl/output/
+
+# generated configs 
+src/*/generated/
+src/*/generated/*
+src/*/img2rad-*.yaml
+src/*/configs/generated/
+src/*/configs/generated/*
+!configs/generated/.gitkeep
+
+# generated transtab tokenizer folder
+transtab/tokenizer/
+transtab/tokenizer/* 
+
+# test notebook
+src/pretrain_transtab/transtab_custom/test.ipynb
+*/test.ipynb
+
+
+# checkpoints 
+src/radtranstab/checkpoints/
+src/rapacl/checkpoints/
+*/checkpoints/
+checkpoints/
