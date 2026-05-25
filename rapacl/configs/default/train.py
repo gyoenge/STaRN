@@ -4,7 +4,7 @@ import os
 
 ROOT_DIR = os.path.join(os.path.expanduser("~"), "workspace", "datasets", "rapacl_data")
 FEATURE_LIST_PATH = os.path.join(ROOT_DIR, "feature_list.txt")
-GENE_LIST_PATH = os.path.join(ROOT_DIR, "var_50genes.json")
+GENE_LIST_PATH = os.path.join(ROOT_DIR, "var_250genes.json") # 250 | 50 
 SELECT_FOLDS = [0, 1, 2, 3]  # for cross-validation fold selection: default 0~3 
 
 PROJECT_DIR = os.path.join(os.path.expanduser("~"), "workspace", "RaPaCL")
@@ -21,11 +21,12 @@ HIDDEN_DIM = 128
 PROJECTION_DIM = 384
 DROPOUT = 0.1
 ACTIVATION = "leakyrelu"
-NUM_SUB_COLS = [72, 54, 36] # [72, 54, 36, 18, 9, 3, 1]    
+NUM_SUB_COLS = [72, 54, 36, 18, 9, 3, 1] # [72, 54, 36] # [72, 54, 36, 18, 9, 3, 1]    
 APE_DROP_RATE = 0.0
 
 # Pathomics Settings
-BACKBONE = "uni" # "densenet121" | "resnet50" | "uni" 
+BACKBONE = "densenet121" #"uni" # "densenet121" | "resnet50" | "uni" 
+PRETRAINED = True 
 PATHOMICS_DIM = 1024
 PATH_PROJ_HIDDEN_DIM = 512
 
@@ -41,8 +42,8 @@ MMCL_LOSS = "multipos_nt_xent" # "symmetric_info_nce" | "multipos_nt_xent"
 CONTRASTIVE_TEMPERATURE = 0.25 # 0.07 | 0.15 ~ 0.3 
 
 MMCL_LAMBDA = 1.0 # 0.6 # 0.7 | 1.0 
-RECON_LAMBDA = 25.0 # 3.0 | 1.0 
-CLS_LAMBDA = 1.0
+RECON_LAMBDA = 25.0 #25.0 # 3.0 | 1.0 
+CLS_LAMBDA = 1.0 # 1.0
 
 ### Train Settings 
 SEED = 0
@@ -57,7 +58,7 @@ USE_PAIR_AUGMENT_BATCH = True
 
 WARMUP_RECON_EPOCHS = 5
 MMCL_RAMPUP_EPOCHS = 20 # 15 # 10
-STAGE1_EPOCHS = 30 # 25 # 20 
+STAGE1_EPOCHS = 100 # 30 # 25 # 20 
 STAGE2_EPOCHS = 50
 
 LR = 1e-4
