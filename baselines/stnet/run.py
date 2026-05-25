@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 from baselines.stnet import build_model
 from baselines.stnet.dataset import STNetDataset
 from baselines.stnet.trainer import (
-    build_optimizer,
     eval_fold,
     retrain_full_train,
     select_best_epoch,
@@ -20,7 +19,15 @@ from baselines.stnet.trainer import (
 )
 from baselines.common.config import apply_cli_overrides, load_yaml, parse_common_args
 from baselines.common.logger import setup_logger
-from baselines.common.utils import ensure_dir, get_device, save_yaml, seed_everything
+from baselines.common.optimizer import build_optimizer
+from baselines.common.utils import (
+    ensure_dir,
+    get_device,
+    resolve_gene_list_path,
+    resolve_split_path,
+    save_yaml,
+    seed_everything,
+)
 
 
 def print_config(cfg: dict[str, Any], logger) -> None:
@@ -30,49 +37,17 @@ def print_config(cfg: dict[str, Any], logger) -> None:
     logger.info("============================")
 
 
-def resolve_gene_list_path(paths_cfg: dict[str, Any], model_cfg: dict[str, Any]) -> Path:
-    if paths_cfg.get("gene_list_path"):
-        return Path(paths_cfg["gene_list_path"])
-
-    bench_data_root = Path(paths_cfg["bench_data_root"])
-    genes_criteria = model_cfg.get("genes_criteria", "var")
-    num_genes = model_cfg.get("num_genes", 250)
-    return bench_data_root / f"{genes_criteria}_{num_genes}genes.json"
-
-
-def resolve_split_path(
-    paths_cfg: dict[str, Any],
-    split_kind: str,
-    outer_fold: int | None = None,
-) -> Path:
-    """
-    priority:
-    1) paths.<split_kind>_split_csv
-    2) {bench_data_root}/splits/{split_kind}_{outer_fold}.csv
-    """
-    direct_key = f"{split_kind}_split_csv"
-    if paths_cfg.get(direct_key):
-        return Path(paths_cfg[direct_key])
-
-    if outer_fold is None:
-        raise ValueError(
-            f"{direct_key} is not set and outer_fold is None, so split path cannot be resolved."
-        )
-
-    bench_data_root = Path(paths_cfg["bench_data_root"])
-    return bench_data_root / "splits" / f"{split_kind}_{outer_fold}.csv"
-
-
 def save_model_checkpoint(model: torch.nn.Module, save_path: Path, logger) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), save_path)
     logger.info("Saved checkpoint: %s", save_path)
 
 
-def load_model_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: torch.device, logger) -> None:
+def load_model_checkpoint(
+    model: torch.nn.Module, ckpt_path: Path, device: torch.device, logger
+) -> None:
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-
     state_dict = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state_dict)
     logger.info("Loaded checkpoint: %s", ckpt_path)
@@ -113,20 +88,11 @@ def run_train_mode(
         transforms=None,
     )
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
     )
 
     model = build_model(model_cfg).to(device)
-    optimizer = build_optimizer(
-        model=model,
-        optimizer_name=train_cfg.get("optimizer_name", "sgd"),
-        lr=train_cfg.get("lr", 1e-4),
-        weight_decay=train_cfg.get("weight_decay", 0.0),
-        momentum=train_cfg.get("momentum", 0.9),
-    )
+    optimizer = build_optimizer(model.parameters(), cfg)
     criterion = torch.nn.MSELoss()
 
     train_history = []
@@ -140,10 +106,7 @@ def run_train_mode(
             criterion=criterion,
         )
 
-        row = {
-            "epoch": epoch,
-            "train_loss": float(train_loss),
-        }
+        row = {"epoch": epoch, "train_loss": float(train_loss)}
 
         if test_split_path is not None:
             test_dataset = STNetDataset(
@@ -153,30 +116,17 @@ def run_train_mode(
                 transforms=None,
             )
             test_loader = DataLoader(
-                test_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
+                test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
             )
-            mean_pcc, _ = eval_fold(
-                model=model,
-                test_loader=test_loader,
-                device=device,
-            )
+            mean_pcc, _ = eval_fold(model=model, test_loader=test_loader, device=device)
             row["eval_mean_pcc"] = float(mean_pcc)
             logger.info(
                 "Epoch %02d/%d | train_loss=%.6f | eval_mean_pcc=%.6f",
-                epoch,
-                max_epochs,
-                train_loss,
-                mean_pcc,
+                epoch, max_epochs, train_loss, mean_pcc,
             )
         else:
             logger.info(
-                "Epoch %02d/%d | train_loss=%.6f",
-                epoch,
-                max_epochs,
-                train_loss,
+                "Epoch %02d/%d | train_loss=%.6f", epoch, max_epochs, train_loss
             )
 
         train_history.append(row)
@@ -221,7 +171,6 @@ def run_eval_mode(
     checkpoint_path = runtime_cfg.get("checkpoint_path")
     if checkpoint_path is None:
         checkpoint_path = str(ckpt_dir / "final_model.pth")
-
     checkpoint_path = Path(checkpoint_path)
 
     logger.info("Eval split: %s", test_split_path)
@@ -243,12 +192,7 @@ def run_eval_mode(
         num_workers=train_cfg.get("num_workers", 0),
     )
 
-    mean_pcc, gene_pccs = eval_fold(
-        model=model,
-        test_loader=test_loader,
-        device=device,
-    )
-
+    mean_pcc, gene_pccs = eval_fold(model=model, test_loader=test_loader, device=device)
     logger.info("Eval mean PCC: %.6f", mean_pcc)
 
     gene_pcc_df = pd.DataFrame({
@@ -315,16 +259,7 @@ def run_tuning_mode(
                 bench_data_root=bench_data_root,
                 gene_list_path=str(gene_list_path),
                 device=device,
-                num_genes=model_cfg.get("num_genes", 250),
-                pretrained=model_cfg.get("pretrained", True),
-                max_epochs=train_cfg.get("max_epochs", 50),
-                batch_size=train_cfg.get("batch_size", 32),
-                num_workers=train_cfg.get("num_workers", 0),
-                seed=cfg.get("seed", 42),
-                optimizer_name=train_cfg.get("optimizer_name", "sgd"),
-                lr=train_cfg.get("lr", 1e-4),
-                weight_decay=train_cfg.get("weight_decay", 0.0),
-                momentum=train_cfg.get("momentum", 0.9),
+                cfg=cfg,
                 logger=logger,
             )
         else:
@@ -339,15 +274,8 @@ def run_tuning_mode(
             bench_data_root=bench_data_root,
             gene_list_path=str(gene_list_path),
             device=device,
-            num_genes=model_cfg.get("num_genes", 250),
-            pretrained=model_cfg.get("pretrained", True),
             num_epochs=best_epoch,
-            batch_size=train_cfg.get("batch_size", 32),
-            num_workers=train_cfg.get("num_workers", 0),
-            optimizer_name=train_cfg.get("optimizer_name", "sgd"),
-            lr=train_cfg.get("lr", 1e-4),
-            weight_decay=train_cfg.get("weight_decay", 0.0),
-            momentum=train_cfg.get("momentum", 0.9),
+            cfg=cfg,
             logger=logger,
         )
 
@@ -368,9 +296,7 @@ def run_tuning_mode(
         )
 
         test_mean_pcc, gene_pccs = eval_fold(
-            model=final_model,
-            test_loader=outer_test_loader,
-            device=device,
+            model=final_model, test_loader=outer_test_loader, device=device
         )
 
         row = {
@@ -391,9 +317,7 @@ def run_tuning_mode(
 
         logger.info(
             "Outer fold %d finished | best_epoch=%d | test_mean_pcc=%.6f",
-            outer_fold,
-            best_epoch,
-            test_mean_pcc,
+            outer_fold, best_epoch, test_mean_pcc,
         )
 
         epoch_score_json = result_dir / f"fold_{outer_fold}_epoch_scores.json"
@@ -460,30 +384,17 @@ def main() -> None:
 
     if args.mode == "train":
         run_train_mode(
-            cfg=cfg,
-            args=args,
-            logger=logger,
-            device=device,
-            run_root=run_root,
-            ckpt_dir=ckpt_dir,
-            result_dir=result_dir,
+            cfg=cfg, args=args, logger=logger, device=device,
+            run_root=run_root, ckpt_dir=ckpt_dir, result_dir=result_dir,
         )
     elif args.mode == "eval":
         run_eval_mode(
-            cfg=cfg,
-            logger=logger,
-            device=device,
-            ckpt_dir=ckpt_dir,
-            result_dir=result_dir,
-            pred_dir=pred_dir,
+            cfg=cfg, logger=logger, device=device,
+            ckpt_dir=ckpt_dir, result_dir=result_dir, pred_dir=pred_dir,
         )
     elif args.mode == "tuning":
         run_tuning_mode(
-            cfg=cfg,
-            logger=logger,
-            device=device,
-            ckpt_dir=ckpt_dir,
-            result_dir=result_dir,
+            cfg=cfg, logger=logger, device=device, ckpt_dir=ckpt_dir, result_dir=result_dir,
         )
     else:
         raise ValueError(f"Unsupported mode: {args.mode}")

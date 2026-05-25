@@ -6,25 +6,11 @@ import os
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 
+from baselines.common.optimizer import build_optimizer
 from .engine import evaluate_loss, train_epoch
 from .loader import build_gene_dataloaders, build_radiomics_dataloaders
 from .model import FusionGeneModel, ImgToRadiomicsModel
-
-
-def build_optimizer(parameters, cfg: dict):
-    train_cfg = cfg["train"]
-    optimizer_name = str(train_cfg.get("optimizer_name", "adamw")).lower()
-    lr = float(train_cfg.get("lr", 1e-4))
-    weight_decay = float(train_cfg.get("weight_decay", 1e-4))
-
-    if optimizer_name == "adam":
-        return optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
-    if optimizer_name == "adamw":
-        return optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
-
-    raise ValueError(f"Unsupported optimizer_name: {optimizer_name}")
 
 
 def _build_backbone_weight_path(cfg: dict, outer_fold: int) -> str:
@@ -234,7 +220,7 @@ def run_all_folds_training(
     logger: logging.Logger,
 ):
     checkpoint_dir = cfg["paths"]["checkpoint_dir"]
-    folds_to_train = list(cfg["runtime"]["folds"])
+    folds_to_train = list(cfg["cv"]["outer_folds"])
 
     logger.info("=" * 100)
     logger.info("Start all-fold training")

@@ -57,3 +57,29 @@ def get_device(runtime_cfg: dict) -> torch.device:
     if str(requested).startswith("cuda") and torch.cuda.is_available():
         return torch.device(requested)
     return torch.device("cpu")
+
+
+def resolve_gene_list_path(paths_cfg: dict, model_cfg: dict) -> Path:
+    if paths_cfg.get("gene_list_path"):
+        return Path(paths_cfg["gene_list_path"])
+    bench_data_root = Path(paths_cfg["bench_data_root"])
+    genes_criteria = model_cfg.get("genes_criteria", "var")
+    num_genes = model_cfg.get("num_genes", 250)
+    return bench_data_root / f"{genes_criteria}_{num_genes}genes.json"
+
+
+def resolve_split_path(
+    paths_cfg: dict,
+    split_kind: str,
+    outer_fold: int | None = None,
+) -> Path:
+    direct_key = f"{split_kind}_split_csv"
+    if paths_cfg.get(direct_key):
+        return Path(paths_cfg[direct_key])
+    if outer_fold is None:
+        raise ValueError(
+            f"'{direct_key}' is not set in config and outer_fold is None — "
+            "cannot resolve split path."
+        )
+    bench_data_root = Path(paths_cfg["bench_data_root"])
+    return bench_data_root / "splits" / f"{split_kind}_{outer_fold}.csv"

@@ -1,16 +1,10 @@
-import os
-import glob
 import argparse
+import glob
+import os
+
 import pandas as pd
-import yaml
 
-
-# ------------------------------------------------------------------
-# utils
-# ------------------------------------------------------------------
-def load_yaml(path: str) -> dict:
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+from baselines.common.config import load_yaml
 
 
 # ------------------------------------------------------------------

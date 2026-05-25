@@ -1,34 +1,19 @@
 from __future__ import annotations
 
 import logging
-import os
 
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
+from baselines.common.dataset import STNetDataset
+from baselines.common.utils import resolve_split_path
 from .cache import load_samplewise_radiomics_targets
-from .dataset import (
-    GeneWithRadiomicsDataset,
-    RadiomicsTargetDataset,
-    STNetDataset,
-)
+from .dataset import GeneWithRadiomicsDataset, RadiomicsTargetDataset
 
 
 def build_transforms():
     t = transforms.Compose([transforms.ToPILImage(), transforms.ToTensor()])
     return t, t
-
-
-def build_fold_csv_paths(bench_data_root: str, outer_fold: int):
-    train_csv = os.path.join(bench_data_root, f"splits/train_{outer_fold}.csv")
-    test_csv = os.path.join(bench_data_root, f"splits/test_{outer_fold}.csv")
-
-    if not os.path.isfile(train_csv):
-        raise FileNotFoundError(f"Train CSV not found: {train_csv}")
-    if not os.path.isfile(test_csv):
-        raise FileNotFoundError(f"Test CSV not found: {test_csv}")
-
-    return train_csv, test_csv
 
 
 def _dataloader_kwargs(cfg: dict) -> dict:
@@ -50,7 +35,8 @@ def _build_base_st_datasets(
     )
 
     train_transform, eval_transform = build_transforms()
-    train_csv, test_csv = build_fold_csv_paths(bench_data_root, outer_fold)
+    train_csv = str(resolve_split_path(cfg["paths"], "train", outer_fold))
+    test_csv = str(resolve_split_path(cfg["paths"], "test", outer_fold))
 
     train_base_dataset = STNetDataset(
         bench_data_root=bench_data_root,

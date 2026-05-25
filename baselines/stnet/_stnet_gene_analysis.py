@@ -30,10 +30,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from baselines.common.config import load_yaml
-from baselines.common.utils import get_device, load_gene_names, seed_everything
+from baselines.common.utils import (
+    get_device,
+    load_gene_names,
+    resolve_gene_list_path,
+    resolve_split_path,
+    seed_everything,
+)
 from baselines.stnet import build_model
 from baselines.stnet.dataset import STNetDataset
-from baselines.stnet.run import resolve_gene_list_path, resolve_split_path
 
 
 TARGET_GENES = [

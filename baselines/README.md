@@ -11,17 +11,19 @@ baselines/
 ├── common/             # Shared utilities
 │   ├── dataset.py      # STNetDataset (unified patch → gene dataset)
 │   ├── metrics.py      # compute_genewise_pcc
-│   ├── utils.py        # load_gene_names, get_device, seed_everything, ...
+│   ├── optimizer.py    # build_optimizer (sgd / adam / adamw)
+│   ├── utils.py        # load_gene_names, get_device, resolve_split_path, ...
 │   ├── config.py       # load_yaml, parse_common_args, apply_cli_overrides
 │   └── logger.py       # setup_logger
 ├── stnet/              # STNet baseline
-│   ├── run.py          # Entry point
+│   ├── run.py          # Entry point (train / eval / tuning modes)
 │   ├── stnet.py        # Model definition
 │   ├── trainer.py      # train_one_epoch, eval_fold, select_best_epoch, ...
 │   ├── dataset.py      # Re-exports STNetDataset from common
 │   └── _stnet_gene_analysis.py  # Per-gene PCC analysis + spatial plots
 ├── img2rad/            # Img2Rad baseline
-│   ├── main.py         # Entry point
+│   ├── run.py          # Entry point (train / eval / all modes)
+│   ├── main.py         # Thin wrapper → run.py (backward compat)
 │   ├── model.py        # PatchImgEncoder, ImgToRadiomicsModel, FusionGeneModel
 │   ├── trainer.py      # Two-stage training (img→rad, then rad+img→gene)
 │   ├── evaluator.py    # Per-fold PCC evaluation + aggregation
@@ -122,21 +124,21 @@ cd /root/workspace/RaPaCL
 
 **Train + eval** (full pipeline):
 ```bash
-python -m baselines.img2rad.main \
+python -m baselines.img2rad.run \
   --config ./baselines/configs/img2rad.yaml \
   --mode all
 ```
 
 **Train only**:
 ```bash
-python -m baselines.img2rad.main \
+python -m baselines.img2rad.run \
   --config ./baselines/configs/img2rad.yaml \
   --mode train
 ```
 
-**Eval only** (requires trained checkpoints):
+**Eval only** (requires trained checkpoints in `paths.output_root`):
 ```bash
-python -m baselines.img2rad.main \
+python -m baselines.img2rad.run \
   --config ./baselines/configs/img2rad.yaml \
   --mode eval
 ```
@@ -160,7 +162,7 @@ bash ./baselines/scripts/run_img2rad_filter-prefix_ablation.sh
 | Section | Key | Description |
 |---|---|---|
 | `paths` | `bench_data_root` | Root of HEST benchmark data |
-| `paths` | `checkpoint_dir` | Where model checkpoints are saved |
+| `paths` | `output_root` | Where run outputs are written (`run_{timestamp}/` subdirs) |
 | `paths` | `stnet_ckpt_dir` | Directory of pretrained STNet backbone weights |
 | `model` | `fusion_mode` | `img_radpred` / `img_radhidden` / `img_rawrad` |
 | `model` | `freeze_img2rad` | Freeze stage-1 weights during gene training |
@@ -169,11 +171,12 @@ bash ./baselines/scripts/run_img2rad_filter-prefix_ablation.sh
 | `model` | `gene_head_hidden_dims` | Hidden dims for fusion→gene MLP |
 | `train` | `num_epochs_img2rad` | Stage-1 training epochs |
 | `train` | `num_epochs_gene` | Stage-2 training epochs |
-| `runtime` | `folds` | List of fold indices to run |
+| `cv` | `outer_folds` | List of fold indices to run |
 | `data` | `radiomics_parquet_dir` | Directory of per-sample radiomics `.parquet` files |
 | `data` | `radiomics_valid_prefixes` | PyRadiomics feature prefixes to include |
 | `data` | `radiomics_apply_train_split_scaling` | Apply train-split z-score normalization to radiomics |
 
+Each run creates a timestamped directory under `output_root`: `run_{timestamp}/checkpoints/`, `run_{timestamp}/results/`.
 Radiomics features are aligned to patch barcodes at load time. Constant features (zero variance on train split) are automatically dropped.
 
 ---
@@ -183,6 +186,9 @@ Radiomics features are aligned to patch barcodes at load time. Constant features
 Shared code used by both baselines:
 
 - **`STNetDataset`** (`common/dataset.py`) — loads H5 patch images and `.h5ad` gene expression for a split CSV. Requires columns `patches_path`, `expr_path`; `sample_id` is optional (defaults to `"unknown"`). The `patch_meta` attribute (list of `{sample_id, barcode}` dicts) is used by the img2rad radiomics alignment pipeline.
+- **`build_optimizer`** (`common/optimizer.py`) — creates SGD / Adam / AdamW from `cfg["train"]`. Used by both baselines.
+- **`resolve_split_path`** (`common/utils.py`) — resolves train/test CSV path from config; falls back to `{bench_data_root}/splits/{kind}_{fold}.csv`.
+- **`resolve_gene_list_path`** (`common/utils.py`) — resolves gene list JSON path from config; falls back to `{bench_data_root}/{criteria}_{n}genes.json`.
 - **`compute_genewise_pcc`** (`common/metrics.py`) — computes per-gene Pearson correlation and mean PCC across all genes.
 - **`load_gene_names`** (`common/utils.py`) — reads gene list from JSON (supports `genes`, `gene_names`, `var_genes` keys, or bare list).
 - **`get_device`** (`common/utils.py`) — resolves `runtime.device` from config, falls back to CPU if CUDA unavailable.

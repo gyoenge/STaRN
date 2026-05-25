@@ -281,7 +281,7 @@ def run_all_folds_pcc_eval(
     save_dir = os.path.join(checkpoint_dir, f"pcceval_run_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
-    folds_to_eval = list(cfg["runtime"]["folds"])
+    folds_to_eval = list(cfg["cv"]["outer_folds"])
     num_genes = int(cfg["model"]["num_genes"])
     fusion_mode = str(cfg["model"].get("fusion_mode", "img_radpred"))
 

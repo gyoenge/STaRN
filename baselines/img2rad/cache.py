@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .dataset import STNetDataset
+from baselines.common.dataset import STNetDataset
 
 
 def _get_radiomics_logging_cfg(cfg: dict | None = None) -> dict:

@@ -3,9 +3,7 @@ from __future__ import annotations
 import torch
 from torch.utils.data import Dataset
 
-from baselines.common.dataset import STNetDataset
-
-__all__ = ["STNetDataset", "RadiomicsTargetDataset", "GeneWithRadiomicsDataset"]
+__all__ = ["RadiomicsTargetDataset", "GeneWithRadiomicsDataset"]
 
 
 class RadiomicsTargetDataset(Dataset):
