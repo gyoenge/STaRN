@@ -290,12 +290,163 @@ class HestRadiomicsDataset(Dataset):
 
 
 class InductiveBatchSampler(Sampler):
-    """
-    batch will contain:
-        - anchor
-        - spatial neighbors
-        - random globals
+    """Batch sampler for neighborhood-aware contrastive training.
+
+    Each batch has exactly ``batch_size`` spots laid out as:
+
+        [ anchor | n_neighbors spatial-kNN spots | n_globals random spots ]
+
+    so ``batch_size = 1 + n_neighbors + n_globals``.
+
+    The kNN graph is built once at construction from the pixel / spatial
+    coordinates stored in each ``_PersampleDataset``.  Neighbours are
+    always drawn from *within the same sample* so they are genuinely
+    spatially adjacent.  Global negatives are drawn from the entire
+    concatenated dataset.
+
+    Args:
+        dataset: An initialised ``HestRadiomicsDataset``.
+        batch_size: Total number of spots per batch.
+        n_neighbors: Spatial kNN neighbours per anchor.
+        shuffle: Permute anchor order each epoch.  Call ``set_epoch``
+            before each epoch when training with multiple epochs.
+        seed: Base RNG seed.  Epoch number is added to it automatically.
     """
 
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        dataset: HestRadiomicsDataset,
+        batch_size: int,
+        n_neighbors: int,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        if batch_size <= n_neighbors + 1:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be > n_neighbors + 1 ({n_neighbors + 1})"
+            )
+        self.dataset     = dataset
+        self.batch_size  = batch_size
+        self.n_neighbors = n_neighbors
+        self.n_globals   = batch_size - 1 - n_neighbors
+        self.shuffle     = shuffle
+        self.seed        = seed
+        self._epoch      = 0
+
+        self._build_knn()
+
+    # ── kNN graph ──────────────────────────────────────────────────────────────
+
+    def _build_knn(self):
+        """Precompute per-spot spatial kNN stored as global dataset indices."""
+        from sklearn.neighbors import NearestNeighbors
+
+        # _knn[global_idx] = int64 array of global neighbour indices
+        self._knn: list[np.ndarray] = []
+
+        offset = 0
+        for ds in self.dataset.datasets:
+            n = len(ds)
+
+            # Coordinates aligned to valid_barcodes order
+            if ds.patch_coords is not None:
+                coords = np.stack([
+                    ds.patch_coords[ds.patch_barcode_to_idx[bc]]
+                    for bc in ds.valid_barcodes
+                ])
+            elif ds.st_coords is not None:
+                coords = np.stack([
+                    ds.st_coords[ds.st_barcode_to_idx[bc]]
+                    for bc in ds.valid_barcodes
+                ])
+            else:
+                # No spatial information: empty neighbour arrays
+                self._knn.extend([np.empty(0, dtype=np.int64)] * n)
+                offset += n
+                continue
+
+            k = min(self.n_neighbors, n - 1)
+            _, indices = (
+                NearestNeighbors(n_neighbors=k + 1)
+                .fit(coords)
+                .kneighbors(coords)
+            )   # (n, k+1) — column 0 is self
+
+            for local_idx in range(n):
+                global_nbrs = (indices[local_idx, 1 : k + 1] + offset).astype(np.int64)
+                self._knn.append(global_nbrs)
+
+            offset += n
+
+    # ── Sampler API ───────────────────────────────────────────────────────────
+
+    def set_epoch(self, epoch: int):
+        """Advance the internal epoch counter so each epoch uses a different shuffle."""
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __iter__(self):
+        rng     = np.random.default_rng(self.seed + self._epoch)
+        n_total = len(self.dataset)
+
+        order = rng.permutation(n_total) if self.shuffle else np.arange(n_total)
+
+        for anchor in map(int, order):
+            nbrs = self._knn[anchor]
+
+            # -- spatial neighbours --
+            if len(nbrs) == 0:
+                # fallback when no coordinates are available
+                neighbors = rng.integers(n_total, size=self.n_neighbors).tolist()
+            elif len(nbrs) >= self.n_neighbors:
+                neighbors = rng.choice(nbrs, self.n_neighbors, replace=False).tolist()
+            else:
+                # fewer stored neighbours than requested → sample with replacement
+                neighbors = rng.choice(nbrs, self.n_neighbors, replace=True).tolist()
+
+            # -- random globals --
+            # Collision with anchor/neighbours is negligible at scale (k << N)
+            globals_idx = rng.choice(n_total, self.n_globals, replace=False).tolist()
+
+            yield [anchor] + neighbors + globals_idx
+
+
+# ── loader factory ────────────────────────────────────────────────────────────
+
+def build_loader(
+    dataset: HestRadiomicsDataset,
+    batch_size: int,
+    n_neighbors: int,
+    num_workers: int = 4,
+    shuffle: bool = True,
+    seed: int = 42,
+) -> DataLoader:
+    """Wrap a ``HestRadiomicsDataset`` with ``InductiveBatchSampler``.
+
+    Args:
+        dataset: Initialised dataset.
+        batch_size: Total spots per batch (anchor + neighbours + globals).
+        n_neighbors: Spatial kNN neighbours per anchor.
+        num_workers: DataLoader worker processes.
+        shuffle: Shuffle anchors each epoch.
+        seed: Base RNG seed.
+
+    Returns:
+        A ``DataLoader`` configured with ``batch_sampler``.
+    """
+    sampler = InductiveBatchSampler(
+        dataset,
+        batch_size=batch_size,
+        n_neighbors=n_neighbors,
+        shuffle=shuffle,
+        seed=seed,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+    )
