@@ -95,6 +95,7 @@ class _PersampleDataset(Dataset):
         self._init_patches()
         self._init_st()
         self._init_radiomics()
+        self._init_uni()
         self._align_barcodes()
 
     # ── init ──────────────────────────────────────────────────────────────────
@@ -148,11 +149,32 @@ class _PersampleDataset(Dataset):
         )
         self.radiomics_barcode_to_idx = {b: i for i, b in enumerate(self.radiomics_barcodes)}
 
+    def _init_uni(self):
+        """Load pre-extracted UNI ViT-L embeddings (DATA_ROOT/embeddings/{sid}_uni.npy).
+
+        File format (saved by .test/extract_uni.py):
+            np.save(path, {"barcodes": np.array([...]), "X": np.ndarray (N, 1024)})
+        """
+        uni_path = self.root / "embeddings" / f"{self.sample_id}_uni.npy"
+        if not uni_path.exists():
+            self.uni_matrix = None
+            self.uni_barcode_to_idx = {}
+            return
+
+        data = np.load(uni_path, allow_pickle=True).item()
+        uni_barcodes = [str(b) for b in data["barcodes"]]
+        self.uni_matrix = data["X"].astype(np.float32)
+        self.uni_barcode_to_idx = {b: i for i, b in enumerate(uni_barcodes)}
+
     def _align_barcodes(self):
-        patch_set = set(self.patches_barcodes)
-        st_set    = set(self.st_barcodes)
-        rad_set   = set(self.radiomics_barcodes)
-        self.valid_barcodes = sorted(patch_set & st_set & rad_set)
+        sets = [
+            set(self.patches_barcodes),
+            set(self.st_barcodes),
+            set(self.radiomics_barcodes),
+        ]
+        if self.uni_matrix is not None:
+            sets.append(set(self.uni_barcode_to_idx.keys()))
+        self.valid_barcodes = sorted(set.intersection(*sets))
 
     # ── dataset protocol ──────────────────────────────────────────────────────
 
@@ -193,6 +215,12 @@ class _PersampleDataset(Dataset):
         st        = torch.from_numpy(self.st_matrix[st_idx].copy())
         radiomics = torch.from_numpy(self.radiomics_matrix[radiomics_idx].copy())
 
+        if self.uni_matrix is not None:
+            uni_idx = self.uni_barcode_to_idx[barcode]
+            uni_emb = torch.from_numpy(self.uni_matrix[uni_idx].copy())
+        else:
+            uni_emb = torch.zeros(1024)
+
         return {
             "idx":       idx,
             "barcode":   barcode,
@@ -200,6 +228,7 @@ class _PersampleDataset(Dataset):
             "patch":     patch,
             "st":        st,
             "radiomics": radiomics,
+            "uni_emb":   uni_emb,
         }
 
     def __del__(self):

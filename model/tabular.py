@@ -3,6 +3,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.init as nn_init
 
 # input -> no pd.DataFrame, just raw tensors
@@ -146,25 +147,51 @@ class RowAttention(nn.Module):
         return x_t.transpose(0, 1)     # (B, F, D)
 
 
+class _ProjHead(nn.Module):
+    """Two-layer MLP projection head with L2 normalisation on output."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.GELU(),
+            nn.Linear(in_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x), dim=-1)
+
+
 class SummaryTableModel(nn.Module):
-    """Tabular representation model for spatial radiomics Summary Tables.
+    """SAINT-style tabular encoder for spatial radiomics Summary Tables.
 
-    Interleaves ColumnAttention and RowAttention layers (SAINT-style) on top of
-    FeatureEmbedding. A learnable [CLS] token is prepended; its final hidden state
-    is returned as the sample-level embedding for contrastive learning / gene prediction.
+    Architecture:
+        Input (B, F)
+          → FeatureEmbedding + [CLS] prepend  →  (B, 1+F, D)
+          → ColumnAttention × num_col_layers  →  h_col  →  z_col (B, proj_dim)
+          → RowAttention    × num_row_layers  →  h_final
+              → z_row (B, proj_dim)   — for L_row distillation
+              → z_out (B, proj_dim)   — for L_self contrastive
 
-    Input:  (B, num_features) — raw radiomics feature tensor
-    Output: cls_emb   (B, hidden_dim)            — CLS embedding
-            token_emb (B, num_features, hidden_dim) — per-feature token embeddings
+    The three projection heads share the same trunk but are kept separate so each
+    loss gradient flows through a dedicated head without interfering.
+
+    Returns:
+        z_col:     (B, proj_dim) — L2-normalised, after column-attention stage
+        z_row:     (B, proj_dim) — L2-normalised, after row-attention stage
+        z_out:     (B, proj_dim) — L2-normalised, used for self-contrastive loss
+        token_emb: (B, F, D)    — final per-feature token embeddings (for recon / probing)
     """
 
     def __init__(
         self,
         num_features: int,
         hidden_dim: int = 128,
-        num_layers: int = 2,
+        num_col_layers: int = 2,
+        num_row_layers: int = 2,
         num_heads: int = 8,
         ffn_dim: int = 256,
+        proj_dim: int = 128,
         dropout: float = 0.0,
         layer_norm_eps: float = 1e-5,
         device: str = "cuda:0",
@@ -181,36 +208,68 @@ class SummaryTableModel(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn_init.trunc_normal_(self.cls_token, std=0.02)
 
-        # Each layer: ColumnAttention then RowAttention
-        self.layers = nn.ModuleList([
-            nn.ModuleList([
-                ColumnAttention(hidden_dim, num_heads, ffn_dim, dropout, layer_norm_eps),
-                RowAttention(hidden_dim, num_heads, ffn_dim, dropout, layer_norm_eps),
-            ])
-            for _ in range(num_layers)
+        # Stage 1: column attention — learns within-patch feature interactions
+        self.col_layers = nn.ModuleList([
+            ColumnAttention(hidden_dim, num_heads, ffn_dim, dropout, layer_norm_eps)
+            for _ in range(num_col_layers)
         ])
+        self.norm_col = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.proj_col = _ProjHead(hidden_dim, proj_dim)
 
-        self.norm = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
+        # Stage 2: row attention — learns cross-patch neighbourhood context
+        self.row_layers = nn.ModuleList([
+            RowAttention(hidden_dim, num_heads, ffn_dim, dropout, layer_norm_eps)
+            for _ in range(num_row_layers)
+        ])
+        self.norm_out = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.proj_row = _ProjHead(hidden_dim, proj_dim)   # for L_row
+        self.proj_out = _ProjHead(hidden_dim, proj_dim)   # for L_self
+
         self.device = device
         self.to(device)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, num_features) — raw radiomics features
         Returns:
-            cls_emb:   (B, hidden_dim)
+            z_col:     (B, proj_dim)
+            z_row:     (B, proj_dim)
+            z_out:     (B, proj_dim)
             token_emb: (B, num_features, hidden_dim)
         """
-        h = self.embed(x)                                   # (B, F, D)
-        cls = self.cls_token.expand(h.size(0), -1, -1)     # (B, 1, D)
-        h = torch.cat([cls, h], dim=1)                     # (B, 1+F, D)
+        h = self.embed(x)                                    # (B, F, D)
+        cls = self.cls_token.expand(h.size(0), -1, -1)      # (B, 1, D)
+        h = torch.cat([cls, h], dim=1)                       # (B, 1+F, D)
 
-        for col_attn, row_attn in self.layers:
-            h = col_attn(h)
-            h = row_attn(h)
+        for layer in self.col_layers:
+            h = layer(h)
+        z_col = self.proj_col(self.norm_col(h[:, 0]))        # (B, proj_dim)
 
-        h = self.norm(h)
-        cls_emb   = h[:, 0]    # (B, D)
-        token_emb = h[:, 1:]   # (B, F, D)
-        return cls_emb, token_emb
+        for layer in self.row_layers:
+            h = layer(h)
+        h = self.norm_out(h)
+        z_row     = self.proj_row(h[:, 0])                   # (B, proj_dim)
+        z_out     = self.proj_out(h[:, 0])                   # (B, proj_dim)
+        token_emb = h[:, 1:]                                 # (B, F, D)
+
+        return z_col, z_row, z_out, token_emb
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the pre-projection CLS embedding for downstream tasks.
+
+        Args:
+            x: (B, num_features)
+        Returns:
+            (B, hidden_dim)
+        """
+        h = self.embed(x)
+        cls = self.cls_token.expand(h.size(0), -1, -1)
+        h = torch.cat([cls, h], dim=1)
+        for layer in self.col_layers:
+            h = layer(h)
+        for layer in self.row_layers:
+            h = layer(h)
+        return self.norm_out(h)[:, 0]  # (B, D)
