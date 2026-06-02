@@ -1,4 +1,4 @@
-"""STaRN eval — cross-attention fusion of tabular backbone + UNI embeddings, LOOCV.
+"""STaRN eval — fusion of tabular backbone + UNI patch embeddings, LOOCV.
 
 Usage:
     cd /root/workspace/STaRN
@@ -7,18 +7,16 @@ Usage:
 Pipeline
 --------
 1. Auto-extract UNI patch embeddings for any sample missing them.
-2. LOOCV over SAMPLE_IDS: train CrossAttentionFusionHead on 3 samples, eval on 1.
+2. LOOCV over SAMPLE_IDS: train FusionGeneHead on 3 samples, eval on 1.
 3. Report gene-wise PCC per fold + mean ± std.
 
-Architecture (frozen backbone, only CrossAttentionFusionHead trained)
-----------------------------------------------------------------------
-  rad  → SummaryTableModel.forward() → token_emb (B, F, 128)  K, V ─┐
-                                                                       ├─ cross-attn
-  uni  → pre-extracted ViT-L emb     → (B, 1024) → proj → (B,1,256)  Q ─┘
-                                                             ↓
-                                             residual + LN → (B, 256)
-                                                             ↓
-                                                    MLP gene head → (B, N_GENES)
+Architecture (frozen backbone, only FusionGeneHead trained)
+-----------------------------------------------------------
+  rad  → SummaryTableModel.encode()  → (B, RAD_DIM=128)  ─┐
+                                                             ├─ concat (B, RAD_DIM+UNI_DIM)
+  uni  → pre-extracted ViT-L emb     → (B, UNI_DIM=1024) ─┘
+                                                             │
+                                              MLP gene head → (B, N_GENES)
 """
 
 from __future__ import annotations
@@ -55,9 +53,7 @@ N_GENES       = 250
 GENE_CRITERIA = "var"
 
 # fusion dimensions
-UNI_DIM       = 1024
-FUSE_DIM      = 256   # both modalities projected to this dim inside cross-attn
-NUM_ATTN_HEADS = 8    # FUSE_DIM must be divisible by NUM_ATTN_HEADS
+UNI_DIM = 1024
 
 HEAD_EPOCHS       = 50
 HEAD_LR           = 3e-4
@@ -143,61 +139,36 @@ def _ensure_uni_embeddings(device: torch.device) -> None:
 
 # ── fusion model ──────────────────────────────────────────────────────────────
 
-class CrossAttentionFusionHead(nn.Module):
-    """UNI query cross-attends to radiomics token sequence, then predicts genes.
+class FusionGeneHead(nn.Module):
+    """Concat raw rad + UNI features, then predict genes.
 
     Trained parameters only (backbone frozen):
-        rad_proj   — Linear(rad_token_dim → fuse_dim)  projects K/V tokens
-        uni_proj   — Linear(uni_dim → fuse_dim)        projects Q
-        cross_attn — MultiheadAttention(fuse_dim, num_heads)
-        norm       — LayerNorm after residual connection
-        gene_head  — MLP(fuse_dim → n_genes)
-
-    Forward
-    -------
-        rad_tokens : (B, F, rad_token_dim)  per-feature token embeddings from backbone
-        uni_emb    : (B, uni_dim)           pre-extracted ViT-L embedding
-
-        kv  = rad_proj(rad_tokens)           (B, F, fuse_dim)
-        q   = uni_proj(uni_emb).unsqueeze(1) (B, 1, fuse_dim)
-        out = cross_attn(Q=q, K=kv, V=kv)   (B, 1, fuse_dim)
-        h   = norm(q + out).squeeze(1)       (B, fuse_dim)   residual + LN
-        return gene_head(h)                  (B, n_genes)
+        gene_head — MLP(rad_dim + uni_dim → n_genes)
     """
 
     def __init__(
         self,
-        rad_token_dim: int,
-        uni_dim:       int,
-        fuse_dim:      int,
-        num_heads:     int,
-        n_genes:       int,
-        dropout:       float,
+        rad_dim: int,
+        uni_dim: int,
+        n_genes: int,
+        dropout: float,
     ):
         super().__init__()
-        self.rad_proj   = nn.Linear(rad_token_dim, fuse_dim)
-        self.uni_proj   = nn.Linear(uni_dim, fuse_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            fuse_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm       = nn.LayerNorm(fuse_dim)
-        self.gene_head  = nn.Sequential(
-            nn.Linear(fuse_dim, fuse_dim),
+        in_dim = rad_dim + uni_dim
+        self.gene_head = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.LayerNorm(in_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(fuse_dim, n_genes),
+            nn.Linear(in_dim, n_genes),
         )
 
     def forward(
         self,
-        rad_tokens: torch.Tensor,   # (B, F, rad_token_dim)
-        uni_emb:    torch.Tensor,   # (B, uni_dim)
-    ) -> torch.Tensor:              # (B, n_genes)
-        kv  = self.rad_proj(rad_tokens)             # (B, F, fuse_dim)
-        q   = self.uni_proj(uni_emb).unsqueeze(1)   # (B, 1, fuse_dim)
-        out, _ = self.cross_attn(q, kv, kv)         # (B, 1, fuse_dim)
-        h   = self.norm(q + out).squeeze(1)         # (B, fuse_dim)
-        return self.gene_head(h)
+        rad_feat: torch.Tensor,   # (B, rad_dim)
+        uni_emb:  torch.Tensor,   # (B, uni_dim)
+    ) -> torch.Tensor:            # (B, n_genes)
+        return self.gene_head(torch.cat([rad_feat, uni_emb], dim=-1))
 
 
 # ── metrics ───────────────────────────────────────────────────────────────────
@@ -262,7 +233,7 @@ def make_loader(
 @torch.no_grad()
 def evaluate(
     backbone: SummaryTableModel,
-    head:     CrossAttentionFusionHead,
+    head:     FusionGeneHead,
     loader:   DataLoader,
     device:   torch.device,
 ) -> tuple[float, float, np.ndarray]:
@@ -274,8 +245,8 @@ def evaluate(
         st      = batch["st"].to(device)
         uni_emb = batch["uni_emb"].to(device)
 
-        _, _, _, rad_tokens = backbone(rad)   # (B, F, hidden_dim)
-        pred = head(rad_tokens, uni_emb)
+        feat = backbone.encode(rad)
+        pred = head(feat, uni_emb)
 
         all_preds.append(pred.cpu())
         all_targets.append(st.cpu())
@@ -309,17 +280,15 @@ def run_fold(
         f"  val spots: {len(val_loader.dataset)}"
     )
 
-    head = CrossAttentionFusionHead(
-        rad_token_dim=cfg.hidden_dim,
+    head = FusionGeneHead(
+        rad_dim=cfg.hidden_dim,
         uni_dim=UNI_DIM,
-        fuse_dim=FUSE_DIM,
-        num_heads=NUM_ATTN_HEADS,
         n_genes=len(gene_names),
         dropout=HEAD_DROPOUT,
     ).to(device)
 
     n_params = sum(p.numel() for p in head.parameters())
-    print(f"  CrossAttentionFusionHead: {n_params:,} params")
+    print(f"  FusionGeneHead: {n_params:,} params")
 
     optimizer = torch.optim.AdamW(
         head.parameters(), lr=HEAD_LR, weight_decay=HEAD_WEIGHT_DECAY
@@ -340,9 +309,9 @@ def run_fold(
             uni_emb = batch["uni_emb"].to(device)
 
             with torch.no_grad():
-                _, _, _, rad_tokens = backbone(rad)   # (B, F, hidden_dim)
+                feat = backbone.encode(rad)
 
-            pred = head(rad_tokens, uni_emb)
+            pred = head(feat, uni_emb)
             loss = criterion(pred, st)
 
             optimizer.zero_grad()
@@ -412,9 +381,8 @@ def main():
     backbone, ckpt_epoch = build_backbone(cfg, device)
     print(f"Backbone   : epoch {ckpt_epoch}, frozen")
     print(
-        f"Fusion     : cross-attn  Q=uni({UNI_DIM}→{FUSE_DIM})"
-        f"  KV=rad_tokens(F×{cfg.hidden_dim}→{FUSE_DIM})"
-        f"  → {len(gene_names)} genes"
+        f"Fusion     : concat rad({cfg.hidden_dim}) + uni({UNI_DIM})"
+        f" → {cfg.hidden_dim + UNI_DIM} → {len(gene_names)}"
     )
 
     # step 4 — LOOCV
@@ -436,7 +404,7 @@ def main():
     std_pcc  = float(np.std(fold_pccs, ddof=1) if len(fold_pccs) > 1 else 0.0)
 
     print(f"\n{'=' * 60}")
-    print("LOOCV Results  (tabular cross-attn UNI fusion)")
+    print("LOOCV Results  (tabular + UNI fusion)")
     print("─" * 60)
     for fold, (sid, pcc) in enumerate(zip(sample_list, fold_pccs)):
         print(f"  Fold {fold}  val={sid:10s}  PCC={pcc:.4f}")
