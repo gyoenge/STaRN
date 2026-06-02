@@ -64,7 +64,7 @@ BATCH_SIZE        = 256
 NUM_WORKERS       = 4
 LOG_EVERY         = 10
 
-SAVE_DIR = Path("checkpoints/loocv_uni")
+SAVE_DIR = Path("checkpoints/loocv_with_uni")
 
 # ── UNI extraction ────────────────────────────────────────────────────────────
 
