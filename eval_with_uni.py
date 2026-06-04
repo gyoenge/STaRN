@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from configs.config import Config
-from dataset.loader import HestRadiomicsDataset, get_common_genes
+from dataset.loader import HestRadiomicsDataset, build_loader, get_common_genes
 from model.tabular import SummaryTableModel
 
 # ── hyperparameters ───────────────────────────────────────────────────────────
@@ -63,6 +63,7 @@ HEAD_DROPOUT      = 0.1
 
 UNI_EXTRACT_BATCH = 128
 BATCH_SIZE        = 256
+N_NEIGHBORS       = 6
 NUM_WORKERS       = 4
 LOG_EVERY         = 10
 
@@ -203,45 +204,28 @@ def build_backbone(cfg: Config, device: torch.device) -> tuple[SummaryTableModel
     return model, ckpt["epoch"]
 
 
-def make_loader(
-    sample_ids: list[str],
-    gene_names: list[str],
-    shuffle:    bool,
-) -> DataLoader:
-    dataset = HestRadiomicsDataset(
-        dataroot=EVAL_DATA_ROOT,
-        sample_ids=sample_ids,
-        gene_names=gene_names,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=shuffle,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=NUM_WORKERS > 0,
-        drop_last=False,
-    )
-
-
 @torch.no_grad()
 def evaluate(
-    backbone: SummaryTableModel,
     head:     FusionGeneHead,
+    backbone: SummaryTableModel,
     loader:   DataLoader,
     device:   torch.device,
 ) -> tuple[float, float, np.ndarray]:
+    """Evaluate using InductiveBatchSampler loader.
+
+    backbone.encode receives the full batch (anchor + neighbors) so row attention
+    sees spatial context — same as training.  Only the anchor (index 0) is
+    collected for PCC, so each spot is evaluated exactly once.
+    """
     head.eval()
     all_preds, all_targets = [], []
 
     for batch in loader:
-        rad     = batch["radiomics"].to(device)
-        st      = batch["st"].to(device)
-        uni_emb = batch["uni_emb"].to(device)
-
-        feat = backbone.encode(rad)
-        pred = head(feat, uni_emb)
-
+        rad     = batch["radiomics"].to(device)    # (B, rad_features)
+        uni_emb = batch["uni_emb"][:1].to(device)  # anchor only
+        st      = batch["st"][:1].to(device)        # anchor only
+        feat    = backbone.encode(rad)              # row attention sees full batch
+        pred    = head(feat[:1], uni_emb)
         all_preds.append(pred.cpu())
         all_targets.append(st.cpu())
 
@@ -267,12 +251,21 @@ def run_fold(
     print(f"\n{'─' * 60}")
     print(f"Fold {fold}  val={val_id}  train={train_ids}")
 
-    train_loader = make_loader(train_ids, gene_names, shuffle=True)
-    val_loader   = make_loader([val_id],  gene_names, shuffle=False)
-    print(
-        f"  train spots: {len(train_loader.dataset)}"
-        f"  val spots: {len(val_loader.dataset)}"
+    train_dataset = HestRadiomicsDataset(
+        dataroot=EVAL_DATA_ROOT, sample_ids=train_ids, gene_names=gene_names,
     )
+    val_dataset = HestRadiomicsDataset(
+        dataroot=EVAL_DATA_ROOT, sample_ids=[val_id], gene_names=gene_names,
+    )
+    train_loader = build_loader(
+        train_dataset, batch_size=BATCH_SIZE, n_neighbors=N_NEIGHBORS,
+        num_workers=NUM_WORKERS, shuffle=True,
+    )
+    val_loader = build_loader(
+        val_dataset, batch_size=BATCH_SIZE, n_neighbors=N_NEIGHBORS,
+        num_workers=NUM_WORKERS, shuffle=False,
+    )
+    print(f"  train spots: {len(train_dataset)}  val spots: {len(val_dataset)}")
 
     head = FusionGeneHead(
         rad_dim=cfg.hidden_dim,
@@ -295,16 +288,18 @@ def run_fold(
     best_per_gene = None
 
     for epoch in range(HEAD_EPOCHS):
+        print(f"Epoch {epoch:3d}/{HEAD_EPOCHS - 1} ...")
+        train_loader.batch_sampler.set_epoch(epoch)
         head.train()
         total_loss, n_seen = 0.0, 0
 
         for batch in train_loader:
             rad     = batch["radiomics"].to(device)
-            st      = batch["st"].to(device)
             uni_emb = batch["uni_emb"].to(device)
+            st      = batch["st"].to(device)
 
             with torch.no_grad():
-                feat = backbone.encode(rad)
+                feat = backbone.encode(rad)   # row attention sees anchor + neighbors
 
             pred = head(feat, uni_emb)
             loss = criterion(pred, st)
@@ -317,7 +312,7 @@ def run_fold(
             n_seen     += rad.size(0)
 
         train_mse = total_loss / n_seen
-        val_mse, val_pcc, per_gene = evaluate(backbone, head, val_loader, device)
+        val_mse, val_pcc, per_gene = evaluate(head, backbone, val_loader, device)
 
         is_best = val_pcc > best_pcc
         if is_best:
