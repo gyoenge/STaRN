@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from configs.config import Config
-from dataset.loader import HestRadiomicsDataset, build_loader, get_common_genes
+from dataset.loader import HestRadiomicsDataset, _PersampleDataset, build_loader, get_common_genes
 from model.tabular import SummaryTableModel
 
 # ── hyperparameters ───────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ HEAD_HIDDEN_DIM   = 256
 HEAD_DROPOUT      = 0.1
 
 UNI_EXTRACT_BATCH = 128
-BATCH_SIZE        = 256
+BATCH_SIZE        = 32 # 256
 N_NEIGHBORS       = 6
 NUM_WORKERS       = 4
 LOG_EVERY         = 10
@@ -180,6 +180,49 @@ def compute_genewise_pcc(
     denom  = torch.sqrt((pc ** 2).sum(0) * (tc ** 2).sum(0)) + eps
     per    = (pc * tc).sum(0) / denom
     return per.mean().item(), per.numpy()
+
+
+# ── dataset patch ─────────────────────────────────────────────────────────────
+
+def _monkey_patch_dataset_getitem_without_patch() -> None:
+    """Replace _PersampleDataset.__getitem__ to skip H5 patch image loading.
+
+    This eval script never uses the patch image — skipping the H5 random read
+    removes the main DataLoader I/O bottleneck.  loader.py is left untouched.
+    """
+    def _getitem_no_patch(self, idx: int) -> dict:
+        barcode       = self.valid_barcodes[idx]
+        patch_idx     = self.patch_barcode_to_idx[barcode]
+        st_idx        = self.st_barcode_to_idx[barcode]
+        radiomics_idx = self.radiomics_barcode_to_idx[barcode]
+
+        if self.patch_coords is not None:
+            coord = torch.tensor(self.patch_coords[patch_idx], dtype=torch.float32)
+        elif self.st_coords is not None:
+            coord = torch.tensor(self.st_coords[st_idx], dtype=torch.float32)
+        else:
+            coord = torch.tensor([-1.0, -1.0])
+
+        st        = torch.from_numpy(self.st_matrix[st_idx].copy())
+        radiomics = torch.from_numpy(self.radiomics_matrix[radiomics_idx].copy())
+
+        if self.uni_matrix is not None:
+            uni_idx = self.uni_barcode_to_idx[barcode]
+            uni_emb = torch.from_numpy(self.uni_matrix[uni_idx].copy())
+        else:
+            uni_emb = torch.zeros(1024)
+
+        return {
+            "idx":       idx,
+            "barcode":   barcode,
+            "coord":     coord,
+            "patch":     torch.empty(0),
+            "st":        st,
+            "radiomics": radiomics,
+            "uni_emb":   uni_emb,
+        }
+
+    _PersampleDataset.__getitem__ = _getitem_no_patch
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -352,6 +395,8 @@ def run_fold(
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    _monkey_patch_dataset_getitem_without_patch()
+
     cfg    = Config()
     device = torch.device(cfg.device)
 
