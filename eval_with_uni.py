@@ -21,6 +21,7 @@ Architecture (frozen backbone, only FusionGeneHead trained)
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import h5py
@@ -55,17 +56,19 @@ GENE_CRITERIA = "var"
 # fusion dimensions
 UNI_DIM = 1024
 
-HEAD_EPOCHS       = 50
-HEAD_LR           = 3e-4
-HEAD_WEIGHT_DECAY = 1e-4
+HEAD_EPOCHS       = 10
+HEAD_LR           = 1e-4
+HEAD_WEIGHT_DECAY = 1e-3
 HEAD_HIDDEN_DIM   = 256
-HEAD_DROPOUT      = 0.1
+HEAD_DROPOUT      = 0.3
+
+PATIENCE = 3
 
 UNI_EXTRACT_BATCH = 128
-BATCH_SIZE        = 32 # 256
+BATCH_SIZE        = 32
 N_NEIGHBORS       = 6
 NUM_WORKERS       = 4
-LOG_EVERY         = 10
+LOG_EVERY         = 1
 
 SAVE_DIR = Path("checkpoints/loocv_with_uni")
 
@@ -329,9 +332,10 @@ def run_fold(
     best_pcc      = -1.0
     best_epoch    = -1
     best_per_gene = None
+    bad_epochs    = 0
 
     for epoch in range(HEAD_EPOCHS):
-        print(f"Epoch {epoch:3d}/{HEAD_EPOCHS - 1} ...")
+        print(f"Epoch {epoch:3d}/{HEAD_EPOCHS - 1} ... [{time.strftime('%H:%M:%S')}]")
         train_loader.batch_sampler.set_epoch(epoch)
         head.train()
         total_loss, n_seen = 0.0, 0
@@ -359,6 +363,7 @@ def run_fold(
 
         is_best = val_pcc > best_pcc
         if is_best:
+            bad_epochs    = 0
             best_pcc      = val_pcc
             best_epoch    = epoch
             best_per_gene = per_gene
@@ -377,6 +382,8 @@ def run_fold(
                 },
                 SAVE_DIR / f"fold_{fold}_best.pt",
             )
+        else:
+            bad_epochs += 1
 
         if epoch % LOG_EVERY == 0 or epoch == HEAD_EPOCHS - 1 or is_best:
             marker = " *" if is_best else ""
@@ -387,6 +394,10 @@ def run_fold(
                 f"val_pcc={val_pcc:.4f}"
                 f"{marker}"
             )
+
+        if bad_epochs >= PATIENCE:
+            print(f"  early stopping at epoch {epoch}")
+            break
 
     print(f"  → best PCC={best_pcc:.4f} at epoch {best_epoch}")
     return best_pcc, best_per_gene
