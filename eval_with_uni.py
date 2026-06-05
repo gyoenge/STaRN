@@ -395,9 +395,9 @@ def run_fold(
                 f"{marker}"
             )
 
-        if bad_epochs >= PATIENCE:
-            print(f"  early stopping at epoch {epoch}")
-            break
+        # if bad_epochs >= PATIENCE:
+        #     print(f"  early stopping at epoch {epoch}")
+        #     break
 
     print(f"  → best PCC={best_pcc:.4f} at epoch {best_epoch}")
     return best_pcc, best_per_gene
