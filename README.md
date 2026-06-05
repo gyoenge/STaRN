@@ -2,7 +2,9 @@
 
 **Summary Table Representation Learning with Semantic Neighborhood Distillation**
 
+<p align="justify">
 STaRN is a representation learning framework for learning radiomics-based handcrafted summary representations of spatial transcriptomics (ST) spots. The core idea is to treat each training batch as a *Summary Table* — rows are spots (anchor + spatial ・ semantic neighbours + random globals), columns are handcrafted features — and apply a SAINT-style dual-attention encoder that models both within-spot feature interactions (column attention) and cross-spot neighbourhood context (row attention). Student representations are distilled from a frozen UNI pathology foundation model, while self-contrastive learning encourages neighborhood-aware and feature-consistent representations. 
+</p>
 
 ---
 
