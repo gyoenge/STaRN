@@ -8,7 +8,7 @@ STaRN is a self-supervised framework for learning radiomics representations of s
 
 ## Overview
 
-![Architecture](figure_saint_distill.png)
+![Architecture](figure_starn.png)
 
 ---
 
