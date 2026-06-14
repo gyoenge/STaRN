@@ -6,14 +6,24 @@ from typing import Optional, Tuple
 @dataclass
 class Config:
     # ── data ──────────────────────────────────────────────────────────────────
-    data_root: Path = Path(
-        "/root/workspace/datasets/hest_radiomics/IDC_Others_Xenium_11/IDC/"
-    ).resolve()
-
-    sample_ids: Tuple[str, ...] = (
-        "TENX191", "TENX192", "TENX193",
-        "TENX195", "TENX196", "TENX197", "TENX198", "TENX199",
-        "TENX200", "TENX201", "TENX202",
+    # Each entry: (data_root, sample_ids). HestRadiomicsDataset concatenates all
+    # sources into a single dataset (radiomics feature layout must match: 390-dim).
+    data_sources: Tuple[Tuple[Path, Tuple[str, ...]], ...] = (
+        (
+            Path("/root/workspace/datasets/hest_radiomics/IDC_Others_Xenium_11/IDC/").resolve(),
+            (
+                "TENX191", "TENX192", "TENX193",
+                "TENX195", "TENX196", "TENX197", "TENX198", "TENX199",
+                "TENX200", "TENX201", "TENX202",
+            ),
+        ),
+        (
+            Path("/root/workspace/datasets/hest_radiomics/IDC_Others_Visium_10/IDC/").resolve(),
+            (
+                "NCBI681", "NCBI682", "NCBI683", "NCBI684", "NCBI776",
+                "TENX13", "TENX14", "TENX39", "TENX53", "TENX68",
+            ),
+        ),
     )
 
     n_genes: int = 250

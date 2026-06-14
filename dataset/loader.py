@@ -304,43 +304,50 @@ def get_common_genes(
 # ── public dataset ────────────────────────────────────────────────────────────
 
 class HestRadiomicsDataset(Dataset):
-    """여러 샘플을 하나의 Dataset으로 연결하는 wrapper.
+    """여러 샘플(여러 data root에 걸칠 수 있음)을 하나의 Dataset으로 연결하는 wrapper.
 
     gene_names를 지정하지 않으면 hest.get_k_genes로 샘플 간 공통 유전자를 자동 선택한다.
     첫 로드 시 ST / radiomics X를 .npy 캐시로 저장하고, 이후 memmap으로 접근한다.
 
     Args:
-        dataroot: 데이터 루트 디렉토리.
-        sample_ids: 불러올 sample ID 목록.
+        sources: (dataroot, sample_ids) 쌍의 목록. 서로 다른 데이터 root(예: Xenium / Visium)를
+            섞어서 하나의 데이터셋으로 합칠 수 있다. radiomics feature 레이아웃(390-dim, 순서)이
+            모든 source에서 동일해야 한다.
         gene_names: 사용할 gene 목록. None이면 n_genes / gene_criteria 기준으로 자동 선택.
         n_genes: gene_names=None일 때 선택할 유전자 수 (기본 250).
         gene_criteria: gene_names=None일 때 선택 기준 — 'var' | 'mean' (기본 'var').
-        cache_dir: .npy 캐시 저장 경로. None이면 dataroot/.cache 사용.
+        cache_dir: .npy 캐시 저장 경로. None이면 각 source의 dataroot/.cache 사용.
         transform: 패치 이미지 transform.
     """
 
     def __init__(
         self,
-        dataroot: str | Path,
-        sample_ids: Sequence[str],
+        sources: Sequence[tuple[str | Path, Sequence[str]]],
         gene_names: Optional[Sequence[str]] = None,
         n_genes: int = 250,
         gene_criteria: str = "var",
         cache_dir: Optional[Path] = None,
         transform=None,
     ):
-        self.sample_ids = list(sample_ids)
-        dataroot = Path(dataroot)
-        cache_dir = Path(cache_dir) if cache_dir else dataroot / ".cache"
+        self.sources = [(Path(root), list(sids)) for root, sids in sources]
+        self.sample_ids = [sid for _, sids in self.sources for sid in sids]
 
         if gene_names is None:
-            st_paths = [dataroot / "st" / f"{sid}.h5ad" for sid in self.sample_ids]
+            st_paths = [
+                root / "st" / f"{sid}.h5ad"
+                for root, sids in self.sources
+                for sid in sids
+            ]
             gene_names = get_common_genes(st_paths, k=n_genes, criteria=gene_criteria)
 
         self.gene_names = list(gene_names)
         self.datasets = [
-            _PersampleDataset(dataroot, sid, self.gene_names, transform, cache_dir)
-            for sid in self.sample_ids
+            _PersampleDataset(
+                root, sid, self.gene_names, transform,
+                Path(cache_dir) if cache_dir else root / ".cache",
+            )
+            for root, sids in self.sources
+            for sid in sids
         ]
         self._concat = ConcatDataset(self.datasets)
 

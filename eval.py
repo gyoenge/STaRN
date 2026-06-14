@@ -200,8 +200,7 @@ def make_loader(
                       If False, use a plain shuffled DataLoader (ablation ②).
     """
     dataset = HestRadiomicsDataset(
-        dataroot=EVAL_DATA_ROOT,
-        sample_ids=sample_ids,
+        sources=[(EVAL_DATA_ROOT, sample_ids)],
         gene_names=gene_names,
     )
     if use_neighbor:

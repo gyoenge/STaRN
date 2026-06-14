@@ -60,8 +60,7 @@ def train():
 
     # ── dataset & loader ──────────────────────────────────────────────────────
     dataset = HestRadiomicsDataset(
-        dataroot=cfg.data_root,
-        sample_ids=list(cfg.sample_ids),
+        sources=cfg.data_sources,
         n_genes=cfg.n_genes,
         gene_criteria=cfg.gene_criteria,
     )
