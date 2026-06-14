@@ -28,6 +28,8 @@ class Config:
     # ── model ─────────────────────────────────────────────────────────────────
     num_features: int = 390             # radiomics feature dimension
     uni_dim: int = 1024                 # UNI ViT-L output dimension
+    scfoundation_dim: int = 3072        # scFoundation embedding dimension
+    teacher_fuse_dim: int = 1024        # AuxNeighborAttention fused (UNI + scFoundation) dim
     hidden_dim: int = 128
     num_col_layers: int = 2
     num_row_layers: int = 1             # design spec: Row Attention Block × 1

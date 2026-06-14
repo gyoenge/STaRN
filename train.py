@@ -14,7 +14,7 @@ Batch layout (per step):
 
 Training computes:
     Z^S = concat( z_out[anchor], mean(z_out[neighbours]), mean(z_out[globals]) )
-    Z^T = AuxNeighborAttention( UNI[anchor : anchor+n_total_neighbours] )
+    Z^T = AuxNeighborAttention( UNI+scFoundation[anchor : anchor+n_total_neighbours] )
     L   = w_self · L_self(z_out_a, z_out_b) + w_distill · L_distill(Z^S, Z^T)
 """
 
@@ -91,6 +91,8 @@ def train():
 
     teacher = AuxNeighborAttention(
         uni_dim=cfg.uni_dim,
+        scfound_dim=cfg.scfoundation_dim,
+        fuse_dim=cfg.teacher_fuse_dim,
         num_heads=cfg.num_heads,
         zs_dim=3 * cfg.proj_dim,
         dropout=cfg.dropout,
@@ -131,9 +133,10 @@ def train():
         running = {"loss": 0.0, "l_self": 0.0, "l_distill": 0.0}
 
         for step, batch in enumerate(loader):
-            rad     = batch["radiomics"].to(device)   # (B, F)
-            uni_emb = batch["uni_emb"].to(device)     # (B, 1024)
-            coords  = batch["coord"].to(device)       # (B, 2)
+            rad      = batch["radiomics"].to(device)        # (B, F)
+            uni_emb  = batch["uni_emb"].to(device)           # (B, 1024)
+            sf_emb   = batch["scfoundation_emb"].to(device)  # (B, 3072)
+            coords   = batch["coord"].to(device)             # (B, 2)
 
             # Two augmented views for L_self
             rad_a = augment(rad)
@@ -146,8 +149,8 @@ def train():
             # Z^S: anchor context representation (view a)
             z_s = _build_zs(z_out_a, cfg.n_neighbors, cfg.n_semantic)   # (3*proj_dim,)
 
-            # Z^T: teacher context representation from UNI embeddings
-            z_t = teacher(uni_emb, n_total_nbr)                          # (3*proj_dim,)
+            # Z^T: teacher context representation from UNI + scFoundation embeddings
+            z_t = teacher(uni_emb, sf_emb, n_total_nbr)                  # (3*proj_dim,)
 
             loss, loss_dict = criterion(
                 z_out_a,

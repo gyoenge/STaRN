@@ -108,6 +108,7 @@ class _PersampleDataset(Dataset):
         self._init_st()
         self._init_radiomics()
         self._init_uni()
+        self._init_scfoundation()
         self._align_barcodes()
 
     # ── init ──────────────────────────────────────────────────────────────────
@@ -178,6 +179,23 @@ class _PersampleDataset(Dataset):
         self.uni_matrix = data["X"].astype(np.float32)
         self.uni_barcode_to_idx = {b: i for i, b in enumerate(uni_barcodes)}
 
+    def _init_scfoundation(self):
+        """Load pre-extracted scFoundation embeddings (DATA_ROOT/embeddings/{sid}_scfoundation.npy).
+
+        File format (saved by .test/extract_scfoundation.py):
+            np.save(path, {"barcodes": np.array([...]), "X": np.ndarray (N, 3072)})
+        """
+        sf_path = self.root / "embeddings" / f"{self.sample_id}_scfoundation.npy"
+        if not sf_path.exists():
+            self.scfoundation_matrix = None
+            self.scfoundation_barcode_to_idx = {}
+            return
+
+        data = np.load(sf_path, allow_pickle=True).item()
+        sf_barcodes = [str(b) for b in data["barcodes"]]
+        self.scfoundation_matrix = data["X"].astype(np.float32)
+        self.scfoundation_barcode_to_idx = {b: i for i, b in enumerate(sf_barcodes)}
+
     def _align_barcodes(self):
         sets = [
             set(self.patches_barcodes),
@@ -186,6 +204,8 @@ class _PersampleDataset(Dataset):
         ]
         if self.uni_matrix is not None:
             sets.append(set(self.uni_barcode_to_idx.keys()))
+        if self.scfoundation_matrix is not None:
+            sets.append(set(self.scfoundation_barcode_to_idx.keys()))
         self.valid_barcodes = sorted(set.intersection(*sets))
 
     # ── dataset protocol ──────────────────────────────────────────────────────
@@ -232,14 +252,21 @@ class _PersampleDataset(Dataset):
         else:
             uni_emb = torch.zeros(1024)
 
+        if self.scfoundation_matrix is not None:
+            sf_idx = self.scfoundation_barcode_to_idx[barcode]
+            scfoundation_emb = torch.from_numpy(self.scfoundation_matrix[sf_idx].copy())
+        else:
+            scfoundation_emb = torch.zeros(3072)
+
         return {
-            "idx":       idx,
-            "barcode":   barcode,
-            "coord":     coord,
-            "patch":     patch,
-            "st":        st,
-            "radiomics": radiomics,
-            "uni_emb":   uni_emb,
+            "idx":              idx,
+            "barcode":          barcode,
+            "coord":            coord,
+            "patch":            patch,
+            "st":               st,
+            "radiomics":        radiomics,
+            "uni_emb":          uni_emb,
+            "scfoundation_emb": scfoundation_emb,
         }
 
     def __del__(self):
