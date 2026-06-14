@@ -52,8 +52,8 @@ SAMPLE_IDS: tuple[str, ...] = ("NCBI783", "NCBI785", "TENX95", "TENX99")
 N_GENES       = 250
 GENE_CRITERIA = "var"
 
-HEAD_EPOCHS       = 50
-HEAD_LR           = 3e-4
+HEAD_EPOCHS       = 10
+HEAD_LR           = 1e-4
 HEAD_WEIGHT_DECAY = 1e-4
 HEAD_HIDDEN_DIM   = 256
 HEAD_DROPOUT      = 0.1
@@ -62,7 +62,7 @@ BATCH_SIZE  = 32
 N_NEIGHBORS = 6
 N_SEMANTIC  = 6
 NUM_WORKERS = 4
-LOG_EVERY   = 5
+LOG_EVERY   = 1
 
 
 # ── dataset helper — skip H5 patch loading ───────────────────────────────────
