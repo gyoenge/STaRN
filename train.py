@@ -4,6 +4,9 @@ Usage:
     cd /root/workspace/STaRN
     python train.py
 
+    # Multi-GPU (DDP)
+    torchrun --nproc_per_node=2 train.py
+
 All hyperparameters are in configs/config.py — edit directly, no CLI flags.
 
 Batch layout (per step):
@@ -20,6 +23,7 @@ Training computes:
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from configs.config import Config
 from dataset.loader import HestRadiomicsDataset, build_loader
@@ -27,6 +31,13 @@ from model.augment import FeatureAugment
 from model.loss import STaRNLoss
 from model.tabular import SummaryTableModel
 from model.teacher import AuxNeighborAttention
+from utils.ddp import (
+    setup_ddp,
+    cleanup_ddp,
+    is_main_process,
+    ddp_barrier,
+    unwrap_model,
+)
 
 
 def _build_zs(
@@ -55,15 +66,31 @@ def _build_zs(
 
 def train():
     cfg = Config()
-    cfg.save_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(cfg.device)
+    distributed, rank, local_rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}") if distributed else torch.device(cfg.device)
+
+    if is_main_process():
+        cfg.save_dir.mkdir(parents=True, exist_ok=True)
+        if distributed:
+            print(f"[DDP] world_size={world_size}")
 
     # ── dataset & loader ──────────────────────────────────────────────────────
-    dataset = HestRadiomicsDataset(
-        sources=cfg.data_sources,
-        n_genes=cfg.n_genes,
-        gene_criteria=cfg.gene_criteria,
-    )
+    # Rank 0 builds the dataset first so it writes the .npy feature caches alone;
+    # other ranks wait, then load the now-cached files (avoids concurrent writes).
+    if is_main_process():
+        dataset = HestRadiomicsDataset(
+            sources=cfg.data_sources,
+            n_genes=cfg.n_genes,
+            gene_criteria=cfg.gene_criteria,
+        )
+    ddp_barrier()
+    if not is_main_process():
+        dataset = HestRadiomicsDataset(
+            sources=cfg.data_sources,
+            n_genes=cfg.n_genes,
+            gene_criteria=cfg.gene_criteria,
+        )
+
     loader = build_loader(
         dataset,
         batch_size=cfg.batch_size,
@@ -72,7 +99,8 @@ def train():
         num_workers=cfg.num_workers,
         shuffle=True,
     )
-    print(dataset)
+    if is_main_process():
+        print(dataset)
 
     # ── models ────────────────────────────────────────────────────────────────
     model = SummaryTableModel(
@@ -85,7 +113,7 @@ def train():
         proj_dim=cfg.proj_dim,
         dropout=cfg.dropout,
         n_pos_bins=cfg.n_pos_bins,
-        device=cfg.device,
+        device=str(device),
     )
 
     teacher = AuxNeighborAttention(
@@ -99,8 +127,15 @@ def train():
 
     n_student = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_teacher = sum(p.numel() for p in teacher.parameters() if p.requires_grad)
-    print(f"SummaryTableModel    — {n_student:,} trainable params")
-    print(f"AuxNeighborAttention — {n_teacher:,} trainable params")
+    if is_main_process():
+        print(f"SummaryTableModel    — {n_student:,} trainable params")
+        print(f"AuxNeighborAttention — {n_teacher:,} trainable params")
+
+    if distributed:
+        # Both branches run the same fixed computation graph every step
+        # (model: two forward calls -> one backward; teacher: one forward call).
+        model = DDP(model, device_ids=[local_rank], static_graph=True)
+        teacher = DDP(teacher, device_ids=[local_rank], static_graph=True)
 
     # ── losses & optimiser ────────────────────────────────────────────────────
     criterion = STaRNLoss(
@@ -168,7 +203,7 @@ def train():
             for k in running:
                 running[k] += loss_dict[k]
 
-            if step % cfg.log_every == 0:
+            if step % cfg.log_every == 0 and is_main_process():
                 avg = {k: v / (step + 1) for k, v in running.items()}
                 print(
                     f"epoch {epoch:3d} | step {step:4d} | "
@@ -180,14 +215,17 @@ def train():
         scheduler.step()
 
         # ── checkpoint ────────────────────────────────────────────────────────
-        ckpt = cfg.save_dir / f"epoch_{epoch:03d}.pt"
-        torch.save({
-            "epoch":   epoch,
-            "model":   model.state_dict(),
-            "teacher": teacher.state_dict(),
-        }, ckpt)
+        if is_main_process():
+            ckpt = cfg.save_dir / f"epoch_{epoch:03d}.pt"
+            torch.save({
+                "epoch":   epoch,
+                "model":   unwrap_model(model).state_dict(),
+                "teacher": unwrap_model(teacher).state_dict(),
+            }, ckpt)
 
-    print("Training complete.")
+    if is_main_process():
+        print("Training complete.")
+    cleanup_ddp()
 
 
 if __name__ == "__main__":

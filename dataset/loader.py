@@ -7,6 +7,7 @@ import hashlib
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 import scanpy as sc
 from PIL import Image
 import bisect
@@ -414,6 +415,13 @@ class InductiveBatchSampler(Sampler):
         self.seed        = seed
         self._epoch      = 0
 
+        if dist.is_available() and dist.is_initialized():
+            self.rank       = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank       = 0
+            self.world_size = 1
+
         self._build_knn()
         if n_semantic > 0:
             self._build_semantic_index()
@@ -516,13 +524,14 @@ class InductiveBatchSampler(Sampler):
         self._epoch = epoch
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(range(self.rank, len(self.dataset), self.world_size))
 
     def __iter__(self):
         rng     = np.random.default_rng(self.seed + self._epoch)
         n_total = len(self.dataset)
 
         order = rng.permutation(n_total) if self.shuffle else np.arange(n_total)
+        order = order[self.rank :: self.world_size]  # disjoint anchor slice per DDP rank
 
         for anchor in map(int, order):
             # -- spatial neighbours --
