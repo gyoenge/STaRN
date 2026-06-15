@@ -134,8 +134,11 @@ def train():
     if distributed:
         # Both branches run the same fixed computation graph every step
         # (model: two forward calls -> one backward; teacher: one forward call).
-        model = DDP(model, device_ids=[local_rank], static_graph=True)
-        teacher = DDP(teacher, device_ids=[local_rank], static_graph=True)
+        # broadcast_buffers=False: model has no stateful buffers to sync, and
+        # re-broadcasting FeatureEmbedding.col_indices between the two forward
+        # calls would bump its autograd version and break Embedding's backward.
+        model = DDP(model, device_ids=[local_rank], static_graph=True, broadcast_buffers=False)
+        teacher = DDP(teacher, device_ids=[local_rank], static_graph=True, broadcast_buffers=False)
 
     # ── losses & optimiser ────────────────────────────────────────────────────
     criterion = STaRNLoss(
