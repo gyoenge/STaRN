@@ -87,6 +87,26 @@ def _scatter(ax, coords, vals, title, s):
     return sc
 
 
+def _select_gene_groups(
+    per_gene_pcc: np.ndarray, k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return indices for top-k, mid-k (closest to median), and bot-k genes."""
+    sorted_asc = np.argsort(per_gene_pcc)
+    top_idx = sorted_asc[::-1][:k]
+    bot_idx = sorted_asc[:k]
+
+    median_pcc = np.median(per_gene_pcc)
+    dist_to_mid = np.abs(per_gene_pcc - median_pcc)
+    # Exclude already-selected top/bot indices from mid candidates
+    excluded = set(top_idx.tolist()) | set(bot_idx.tolist())
+    candidate_mask = np.array([i not in excluded for i in range(len(per_gene_pcc))])
+    candidate_idx  = np.where(candidate_mask)[0]
+    mid_order = candidate_idx[np.argsort(dist_to_mid[candidate_idx])]
+    mid_idx = mid_order[:k]
+
+    return top_idx, mid_idx, bot_idx
+
+
 def plot_sample(
     sample_id:    str,
     coords:       np.ndarray,
@@ -98,8 +118,15 @@ def plot_sample(
     n_top:        int,
     save_path:    Path,
 ):
-    top_idx = np.argsort(per_gene_pcc)[::-1][:n_top]
-    n_rows  = 1 + n_top  # mean row + one row per gene
+    top_idx, mid_idx, bot_idx = _select_gene_groups(per_gene_pcc, n_top)
+
+    # Section layout: [mean] + [top-k] + [mid-k] + [bot-k]
+    sections = [
+        ("Top", top_idx),
+        ("Mid", mid_idx),
+        ("Bot", bot_idx),
+    ]
+    n_rows = 1 + n_top * 3
 
     # Dot size: inversely proportional to spot count, clamped
     s = float(np.clip(120_000 / max(len(coords), 1), 1.0, 50.0))
@@ -130,17 +157,23 @@ def plot_sample(
         sc = _scatter(ax, coords, arr, lbl, s)
         plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, label="z-score")
 
-    # Rows 1+: top individual genes by PCC
-    for row, gi in enumerate(top_idx, start=1):
-        pcc  = per_gene_pcc[gi]
-        name = gene_names[gi]
-        for ax, arr, lbl in zip(
-            axes[row],
-            [gt_z[:, gi], pr_z[:, gi]],
-            [f"GT  |  {name}", f"Pred  |  {name}  (PCC = {pcc:.3f})"],
-        ):
-            sc = _scatter(ax, coords, arr, lbl, s)
-            plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, label="z-score")
+    # Rows 1+: top / mid / bot gene sections
+    row = 1
+    for section_label, indices in sections:
+        for gi in indices:
+            pcc  = per_gene_pcc[gi]
+            name = gene_names[gi]
+            for ax, arr, lbl in zip(
+                axes[row],
+                [gt_z[:, gi], pr_z[:, gi]],
+                [
+                    f"[{section_label}] GT  |  {name}",
+                    f"[{section_label}] Pred  |  {name}  (PCC={pcc:.3f})",
+                ],
+            ):
+                sc = _scatter(ax, coords, arr, lbl, s)
+                plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, label="z-score")
+            row += 1
 
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
