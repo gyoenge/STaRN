@@ -1,25 +1,28 @@
 """Ablation study: UNI-only baseline vs STaRN (fusion + neighbor).
 
-Runs LOOCV gene prediction for two methods under comparable conditions,
-prints a comparison table, then generates side-by-side spatial visualizations
-with genes selected by the PCC gap (STaRN − UNI-only).
+Compares two feature extraction strategies under the same prediction head.
 
 Methods
 -------
-uni_only  UNI(1024) → MLP(256) → 250 genes          [no backbone, plain DataLoader]
-starn     concat(STaRN(128), UNI(1024)) → MLP → 250  [pretrained backbone, neighbor loader]
+uni_only  UNI(1024)                              [no backbone, plain DataLoader]
+starn     concat(STaRN(128), UNI(1024))          [pretrained backbone, plain DataLoader]
+
+Head options
+------------
+--head mlp    Two-layer MLP, trained with Adam (default)
+--head ridge  Ridge regression, fit on all train features at once (no epoch loop)
 
 Gene groups in visualization
 -----------------------------
-[Win]  STaRN wins most        (largest positive gap)
+[Win]  STaRN wins most        (largest positive PCC gap)
 [Tie]  methods perform similarly (smallest |gap|)
 [Lose] UNI-only wins          (largest negative gap)
 
 Usage
 -----
-    cd /root/workspace/STaRN
-    python ablation.py --ckpt checkpoints/epoch_099.pt
-    python ablation.py --ckpt checkpoints/epoch_099.pt --top-k 3 --skip-eval
+    python ablation.py --ckpt checkpoints/epoch_099.pt --head ridge
+    python ablation.py --ckpt checkpoints/epoch_099.pt --head mlp --skip-eval
+    python ablation.py --ckpt checkpoints/epoch_099.pt --head ridge --viz-only
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from eval import (
     _patch_dataset_no_img,
     build_backbone,
     MLPGeneHead,
+    compute_genewise_pcc,
     run_fold,
     EVAL_DATA_ROOT,
     SAMPLE_IDS,
@@ -49,6 +53,9 @@ from eval import (
     GENE_CRITERIA,
     HEAD_HIDDEN_DIM,
     HEAD_DROPOUT,
+    HEAD_LR,
+    HEAD_WEIGHT_DECAY,
+    HEAD_EPOCHS,
     NUM_WORKERS,
 )
 from model.tabular import SummaryTableModel
@@ -61,16 +68,12 @@ METHODS = [
         "mode":         "uni_only",
         "label":        "UNI-only",
         "use_backbone": False,
-        "use_neighbor": False,   # no spatial context needed; plain DataLoader
-        "ckpt_dir":     Path("checkpoints/loocv_uni_only_no_neighbor"),
     },
     {
         "name":         "starn",
         "mode":         "fusion",
         "label":        "STaRN",
         "use_backbone": True,
-        "use_neighbor": True,    # spatial + semantic neighbor context
-        "ckpt_dir":     Path("checkpoints/loocv_fusion_neighbor"),
     },
 ]
 
@@ -80,27 +83,173 @@ CMAP        = "RdBu_r"
 VMIN, VMAX  = -2.0, 2.0
 
 
-# ── inference ─────────────────────────────────────────────────────────────────
+def _ckpt_dir(method_name: str, head: str) -> Path:
+    return Path(f"checkpoints/loocv_{method_name}_{head}")
+
+
+# ── feature extraction (shared by Ridge and viz) ──────────────────────────────
+
+@torch.no_grad()
+def extract_all_features(
+    method:   dict,
+    backbone: Optional[SummaryTableModel],
+    dataset:  HestRadiomicsDataset,
+    device:   torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract (features, targets, coords) for every spot in dataset.
+
+    Uses a plain DataLoader so features are deterministic and independent of
+    batch composition.  For STaRN, the backbone's row attention sees batch-mates
+    but without explicit neighbor structure — acceptable for feature extraction.
+
+    Returns:
+        feats   (N, feat_dim)   float32
+        targets (N, n_genes)    float32
+        coords  (N, 2)          float32
+    """
+    loader = DataLoader(
+        dataset,
+        batch_size=INFER_BATCH,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        drop_last=False,
+    )
+
+    feats_l, targets_l, coords_l = [], [], []
+    for batch in loader:
+        rad     = batch["radiomics"].to(device)
+        uni_emb = batch["uni_emb"].to(device)
+        coord   = batch["coord"]
+        gt      = batch["st"]
+
+        if method["use_backbone"] and backbone is not None:
+            z    = backbone.encode(rad, coord.to(device))
+            feat = torch.cat([z, uni_emb], dim=-1)
+        else:
+            feat = uni_emb
+
+        feats_l.append(feat.cpu().numpy())
+        targets_l.append(gt.numpy())
+        coords_l.append(coord.numpy())
+
+    return (
+        np.concatenate(feats_l,   0).astype(np.float32),
+        np.concatenate(targets_l, 0).astype(np.float32),
+        np.concatenate(coords_l,  0).astype(np.float32),
+    )
+
+
+def zscore(X: np.ndarray) -> np.ndarray:
+    return (X - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-8)
+
+
+# ── Ridge head ────────────────────────────────────────────────────────────────
+
+class RidgeWrapper:
+    """Thin torch-compatible wrapper around a fitted sklearn Ridge model.
+
+    Stores coef (G, F) and intercept (G,) as tensors so infer_method can call
+    it identically to MLPGeneHead.
+    """
+
+    def __init__(self, coef: np.ndarray, intercept: np.ndarray, device: torch.device):
+        self.coef      = torch.tensor(coef,      dtype=torch.float32, device=device)
+        self.intercept = torch.tensor(intercept, dtype=torch.float32, device=device)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.coef.T + self.intercept
+
+    def eval(self) -> "RidgeWrapper":
+        return self
+
+    def to(self, device: torch.device) -> "RidgeWrapper":
+        self.coef      = self.coef.to(device)
+        self.intercept = self.intercept.to(device)
+        return self
+
+
+def run_ridge_fold(
+    fold:      int,
+    val_id:    str,
+    train_ids: list[str],
+    gene_names: list[str],
+    method:    dict,
+    backbone:  Optional[SummaryTableModel],
+    cfg:       Config,
+    device:    torch.device,
+    alpha:     float,
+    save_dir:  Path,
+) -> tuple[float, np.ndarray]:
+    from sklearn.linear_model import Ridge
+
+    print(f"\n{'─' * 60}")
+    print(f"Fold {fold}  val={val_id}  train={train_ids}")
+
+    train_ds = HestRadiomicsDataset(
+        sources=[(EVAL_DATA_ROOT, train_ids)],
+        gene_names=gene_names,
+    )
+    val_ds = HestRadiomicsDataset(
+        sources=[(EVAL_DATA_ROOT, [val_id])],
+        gene_names=gene_names,
+    )
+    print(f"  train spots: {len(train_ds)}  val spots: {len(val_ds)}")
+
+    print("  extracting train features...", end=" ", flush=True)
+    X_tr, y_tr, _ = extract_all_features(method, backbone, train_ds, device)
+    print(f"done  {X_tr.shape}")
+
+    print("  extracting val features...", end=" ", flush=True)
+    X_val, y_val, _ = extract_all_features(method, backbone, val_ds, device)
+    print(f"done  {X_val.shape}")
+
+    print(f"  fitting Ridge(alpha={alpha})...", end=" ", flush=True)
+    model = Ridge(alpha=alpha, fit_intercept=True)
+    model.fit(X_tr, y_tr)
+    print("done")
+
+    pred_val = model.predict(X_val).astype(np.float32)
+    pred_t   = torch.from_numpy(pred_val)
+    targ_t   = torch.from_numpy(y_val)
+    mean_pcc, per_gene = compute_genewise_pcc(pred_t, targ_t)
+    val_mse  = float(F.mse_loss(pred_t, targ_t).item())
+
+    print(f"  val_mse={val_mse:.4f}  val_pcc={mean_pcc:.4f}")
+    print(f"  → best PCC={mean_pcc:.4f}")
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    np.save(
+        save_dir / f"fold_{fold}_ridge.npy",
+        {
+            "fold":         fold,
+            "val_id":       val_id,
+            "train_ids":    train_ids,
+            "gene_names":   gene_names,
+            "coef":         model.coef_.astype(np.float32),       # (G, F)
+            "intercept":    model.intercept_.astype(np.float32),  # (G,)
+            "per_gene_pcc": per_gene.astype(np.float32),
+            "val_genewise_pcc": float(mean_pcc),
+            "alpha":        alpha,
+        },
+        allow_pickle=True,
+    )
+
+    return mean_pcc, per_gene
+
+
+# ── MLP inference helper ──────────────────────────────────────────────────────
 
 @torch.no_grad()
 def infer_method(
     method:   dict,
     backbone: Optional[SummaryTableModel],
-    head:     MLPGeneHead,
+    head,                   # MLPGeneHead | RidgeWrapper
     dataset:  HestRadiomicsDataset,
     device:   torch.device,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run full-dataset inference for one method.
-
-    Uses a plain DataLoader (no neighbor sampling) so every spot is predicted
-    independently. Row attention in the backbone still sees batch-mates but
-    without explicit neighbor structure — acceptable for visualization.
-
-    Returns:
-        coords  (N, 2)
-        gt      (N, G)
-        pred    (N, G)
-    """
+    """Full-dataset inference; returns (coords, gt, pred) all as float32 np arrays."""
     loader = DataLoader(
         dataset,
         batch_size=INFER_BATCH,
@@ -118,26 +267,22 @@ def infer_method(
         gt      = batch["st"]
 
         if method["use_backbone"] and backbone is not None:
-            z    = backbone.encode(rad, coord.to(device))     # (B, hidden_dim)
-            feat = torch.cat([z, uni_emb], dim=-1)            # (B, hidden+uni)
+            z    = backbone.encode(rad, coord.to(device))
+            feat = torch.cat([z, uni_emb], dim=-1)
         else:
-            feat = uni_emb                                     # (B, uni_dim)
+            feat = uni_emb
 
         pred = head(feat)
 
         coords_l.append(coord.numpy())
         gt_l.append(gt.numpy())
-        pred_l.append(pred.cpu().numpy())
+        pred_l.append(pred.cpu().numpy() if isinstance(pred, torch.Tensor) else pred)
 
     return (
         np.concatenate(coords_l, 0).astype(np.float32),
         np.concatenate(gt_l,     0).astype(np.float32),
         np.concatenate(pred_l,   0).astype(np.float32),
     )
-
-
-def zscore(X: np.ndarray) -> np.ndarray:
-    return (X - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-8)
 
 
 # ── gene group selection ──────────────────────────────────────────────────────
@@ -147,21 +292,15 @@ def select_gene_groups_by_gap(
     pcc_star: np.ndarray,
     k:        int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Select k genes for each of three groups based on PCC gap (STaRN - UNI-only).
-
-    win_idx  — STaRN wins most  (largest positive gap)
-    tie_idx  — methods tied     (smallest |gap|, excluding win/lose)
-    lose_idx — UNI-only wins    (largest negative gap, i.e. most negative gap)
-    """
     gap = pcc_star - pcc_uni
-    sorted_asc = np.argsort(gap)              # ascending gap
-    win_idx  = sorted_asc[::-1][:k]           # top-k positive gap
-    lose_idx = sorted_asc[:k]                 # top-k negative gap
+    sorted_asc = np.argsort(gap)
+    win_idx  = sorted_asc[::-1][:k]
+    lose_idx = sorted_asc[:k]
 
-    excluded = set(win_idx.tolist()) | set(lose_idx.tolist())
-    remain   = np.array([i for i in range(len(gap)) if i not in excluded])
+    excluded  = set(win_idx.tolist()) | set(lose_idx.tolist())
+    remain    = np.array([i for i in range(len(gap)) if i not in excluded])
     tie_order = remain[np.argsort(np.abs(gap[remain]))]
-    tie_idx  = tie_order[:k]
+    tie_idx   = tie_order[:k]
 
     return win_idx, tie_idx, lose_idx
 
@@ -182,26 +321,22 @@ def _scatter(ax, coords, vals, title, s):
 
 
 def plot_ablation_sample(
-    sample_id:   str,
-    coords:      np.ndarray,
-    gt_z:        np.ndarray,
-    uni_z:       np.ndarray,
-    star_z:      np.ndarray,
-    pcc_uni:     np.ndarray,
-    pcc_star:    np.ndarray,
-    gene_names:  list[str],
-    ckpt_epoch:  int,
-    n_top:       int,
-    save_path:   Path,
+    sample_id:  str,
+    coords:     np.ndarray,
+    gt_z:       np.ndarray,
+    uni_z:      np.ndarray,
+    star_z:     np.ndarray,
+    pcc_uni:    np.ndarray,
+    pcc_star:   np.ndarray,
+    gene_names: list[str],
+    ckpt_epoch: int,
+    head_type:  str,
+    n_top:      int,
+    save_path:  Path,
 ):
     win_idx, tie_idx, lose_idx = select_gene_groups_by_gap(pcc_uni, pcc_star, n_top)
-
-    sections = [
-        ("[Win]",  win_idx),
-        ("[Tie]",  tie_idx),
-        ("[Lose]", lose_idx),
-    ]
-    n_rows = 1 + n_top * 3
+    sections = [("[Win]", win_idx), ("[Tie]", tie_idx), ("[Lose]", lose_idx)]
+    n_rows   = 1 + n_top * 3
 
     s      = float(np.clip(120_000 / max(len(coords), 1), 1.0, 50.0))
     x_span = float(np.ptp(coords[:, 0]))
@@ -219,45 +354,38 @@ def plot_ablation_sample(
     uni_mean_pcc  = float(pcc_uni.mean())
     star_mean_pcc = float(pcc_star.mean())
     fig.suptitle(
-        f"{sample_id}  |  epoch {ckpt_epoch:03d}  |  {len(coords):,} spots\n"
+        f"{sample_id}  |  epoch {ckpt_epoch:03d}  |  head={head_type}  |  {len(coords):,} spots\n"
         f"Mean PCC — UNI-only: {uni_mean_pcc:.4f}   STaRN: {star_mean_pcc:.4f}   "
         f"Δ={star_mean_pcc - uni_mean_pcc:+.4f}",
         fontsize=10, fontweight="bold",
     )
 
-    # Column headers
-    for ax, lbl in zip(axes[0], ["GT  (mean z-score)", "UNI-only  (mean)", "STaRN  (mean)"]):
-        pass   # titles handled per-scatter call below
-
-    # Row 0: mean z-score
     for ax, arr, lbl in zip(
         axes[0],
-        [gt_z.mean(1),  uni_z.mean(1),  star_z.mean(1)],
-        ["GT  (mean z-score, 250 genes)",
-         f"UNI-only  (mean)  PCC={uni_mean_pcc:.3f}",
-         f"STaRN     (mean)  PCC={star_mean_pcc:.3f}"],
+        [gt_z.mean(1), uni_z.mean(1), star_z.mean(1)],
+        [
+            "GT  (mean z-score, 250 genes)",
+            f"UNI-only  (mean)  PCC={uni_mean_pcc:.3f}",
+            f"STaRN     (mean)  PCC={star_mean_pcc:.3f}",
+        ],
     ):
         sc = _scatter(ax, coords, arr, lbl, s)
         plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, label="z-score")
 
-    # Gene rows
     row = 1
     gap = pcc_star - pcc_uni
     for sec_label, indices in sections:
         for gi in indices:
             name = gene_names[gi]
-            pu   = pcc_uni[gi]
-            ps   = pcc_star[gi]
-            dg   = gap[gi]
-            titles = [
-                f"{sec_label} GT  |  {name}",
-                f"{sec_label} UNI-only  PCC={pu:.3f}",
-                f"{sec_label} STaRN     PCC={ps:.3f}  (Δ={dg:+.3f})",
-            ]
+            pu, ps, dg = pcc_uni[gi], pcc_star[gi], gap[gi]
             for ax, arr, lbl in zip(
                 axes[row],
                 [gt_z[:, gi], uni_z[:, gi], star_z[:, gi]],
-                titles,
+                [
+                    f"{sec_label} GT  |  {name}",
+                    f"{sec_label} UNI-only  PCC={pu:.3f}",
+                    f"{sec_label} STaRN     PCC={ps:.3f}  (Δ={dg:+.3f})",
+                ],
             ):
                 sc = _scatter(ax, coords, arr, lbl, s)
                 plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, label="z-score")
@@ -274,48 +402,38 @@ def print_comparison_table(
     method_results: dict[str, list[float]],
     gene_names:     list[str],
     method_pergene: dict[str, list[np.ndarray]],
+    head_type:      str,
 ) -> None:
     sample_list = list(SAMPLE_IDS)
-    col_w = 12
+    col_w       = 12
 
     print(f"\n{'=' * 70}")
-    print("Ablation Results  —  LOOCV gene-wise PCC")
+    print(f"Ablation Results  —  LOOCV gene-wise PCC  [head={head_type}]")
     print("─" * 70)
-    header = f"{'Sample':<12}" + "".join(f"{m['label']:>{col_w}}" for m in METHODS)
-    print(header)
+    print(f"{'Sample':<12}" + "".join(f"{m['label']:>{col_w}}" for m in METHODS))
     print("─" * 70)
     for fold, sid in enumerate(sample_list):
         row = f"{sid:<12}"
         for m in METHODS:
-            pcc = method_results[m["name"]][fold]
-            row += f"{pcc:>{col_w}.4f}"
+            row += f"{method_results[m['name']][fold]:>{col_w}.4f}"
         print(row)
     print("─" * 70)
 
-    row = f"{'Mean':12}"
-    for m in METHODS:
-        mean = float(np.mean(method_results[m["name"]]))
-        row += f"{mean:>{col_w}.4f}"
-    print(row)
+    means = {m["name"]: float(np.mean(method_results[m["name"]])) for m in METHODS}
+    stds  = {m["name"]: float(np.std(method_results[m["name"]], ddof=1)) for m in METHODS}
+    print(f"{'Mean':12}" + "".join(f"{means[m['name']]:>{col_w}.4f}" for m in METHODS))
+    print(f"{'Std':12}"  + "".join(f"{stds[m['name']]:>{col_w}.4f}"  for m in METHODS))
 
-    row = f"{'Std':12}"
-    for m in METHODS:
-        vals = method_results[m["name"]]
-        std  = float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0)
-        row += f"{std:>{col_w}.4f}"
-    print(row)
-
-    # Delta column (STaRN - UNI-only)
     pccs_uni  = method_results["uni_only"]
     pccs_star = method_results["starn"]
     deltas    = [s - u for s, u in zip(pccs_star, pccs_uni)]
+    mean_delta = float(np.mean(deltas))
     print("─" * 70)
-    print(f"{'Δ (STaRN−UNI)':12}" + "".join(
-        f"{d:>{col_w}+.4f}" for d in deltas + [float(np.mean(deltas))]
-    ))
+    print(f"{'Δ(STaRN−UNI)':12}" +
+          "".join(f"{d:+{col_w}.4f}" for d in deltas) +
+          f"  mean={mean_delta:+.4f}")
     print(f"{'=' * 70}")
 
-    # Top/bottom genes by mean PCC gap
     if "uni_only" in method_pergene and "starn" in method_pergene:
         mean_uni  = np.stack(method_pergene["uni_only"]).mean(0)
         mean_star = np.stack(method_pergene["starn"]).mean(0)
@@ -323,11 +441,10 @@ def print_comparison_table(
 
         top5 = np.argsort(gap)[::-1][:5]
         bot5 = np.argsort(gap)[:5]
-
         print("\nTop-5 genes where STaRN gains most over UNI-only:")
         for i in top5:
             print(f"  {gene_names[i]:20s}  UNI={mean_uni[i]:.4f}  STaRN={mean_star[i]:.4f}  Δ={gap[i]:+.4f}")
-        print("\nTop-5 genes where UNI-only outperforms STaRN:")
+        print("Top-5 genes where UNI-only outperforms STaRN:")
         for i in bot5:
             print(f"  {gene_names[i]:20s}  UNI={mean_uni[i]:.4f}  STaRN={mean_star[i]:.4f}  Δ={gap[i]:+.4f}")
         print()
@@ -335,36 +452,71 @@ def print_comparison_table(
 
 # ── LOOCV runner ──────────────────────────────────────────────────────────────
 
+def _load_fold_ckpt(
+    ckpt_path: Path, head_type: str, device: torch.device
+) -> tuple[float, np.ndarray, list[str]]:
+    """Load PCC and gene names from a saved fold checkpoint."""
+    if head_type == "ridge":
+        saved = np.load(ckpt_path, allow_pickle=True).item()
+    else:
+        saved = torch.load(ckpt_path, map_location=device, weights_only=False)
+    return (
+        float(saved["val_genewise_pcc"]),
+        np.array(saved["per_gene_pcc"]),
+        list(saved["gene_names"]),
+    )
+
+
 def run_ablation_eval(
-    gene_names: list[str],
-    backbone:   Optional[SummaryTableModel],
-    cfg:        Config,
-    device:     torch.device,
-    ckpt_path:  Optional[Path],
-    skip_eval:  bool,
+    gene_names:  list[str],
+    backbone:    Optional[SummaryTableModel],
+    cfg:         Config,
+    device:      torch.device,
+    ckpt_path:   Optional[Path],
+    head_type:   str,
+    ridge_alpha: float,
+    skip_eval:   bool,
 ) -> tuple[dict[str, list[float]], dict[str, list[np.ndarray]]]:
-    """Run LOOCV for all methods; skip if checkpoints already exist and skip_eval=True."""
     sample_list   = list(SAMPLE_IDS)
     method_results: dict[str, list[float]]      = {m["name"]: [] for m in METHODS}
     method_pergene: dict[str, list[np.ndarray]] = {m["name"]: [] for m in METHODS}
 
     for m in METHODS:
         print(f"\n{'#' * 60}")
-        print(f"# Method: {m['label']}  (mode={m['mode']}, neighbor={m['use_neighbor']})")
+        print(f"# Method: {m['label']}  head={head_type}")
         print(f"{'#' * 60}")
 
         backbone_for_method = backbone if m["use_backbone"] else None
+        save_dir = _ckpt_dir(m["name"], head_type)
 
         for fold, val_id in enumerate(sample_list):
-            train_ids    = [s for s in sample_list if s != val_id]
-            fold_ckpt    = m["ckpt_dir"] / f"fold_{fold}_best.pt"
+            train_ids = [s for s in sample_list if s != val_id]
+
+            # Check for existing checkpoint
+            if head_type == "ridge":
+                fold_ckpt = save_dir / f"fold_{fold}_ridge.npy"
+            else:
+                fold_ckpt = save_dir / f"fold_{fold}_best.pt"
 
             if skip_eval and fold_ckpt.exists():
-                saved = torch.load(fold_ckpt, map_location="cpu", weights_only=False)
-                best_pcc = float(saved["val_genewise_pcc"])
-                per_gene = np.array(saved["per_gene_pcc"])
-                print(f"  [skip] fold {fold} val={val_id}  PCC={best_pcc:.4f}  (loaded from checkpoint)")
+                best_pcc, per_gene, _ = _load_fold_ckpt(fold_ckpt, head_type, device)
+                print(f"  [skip] fold {fold} val={val_id}  PCC={best_pcc:.4f}")
+            elif head_type == "ridge":
+                best_pcc, per_gene = run_ridge_fold(
+                    fold=fold,
+                    val_id=val_id,
+                    train_ids=train_ids,
+                    gene_names=gene_names,
+                    method=m,
+                    backbone=backbone_for_method,
+                    cfg=cfg,
+                    device=device,
+                    alpha=ridge_alpha,
+                    save_dir=save_dir,
+                )
             else:
+                # MLP: reuse eval.py run_fold (uses InductiveBatchSampler for starn)
+                use_neighbor = m["use_backbone"]   # starn=True, uni_only=False
                 best_pcc, per_gene = run_fold(
                     fold=fold,
                     val_id=val_id,
@@ -373,9 +525,9 @@ def run_ablation_eval(
                     backbone=backbone_for_method,
                     cfg=cfg,
                     mode=m["mode"],
-                    use_neighbor=m["use_neighbor"],
+                    use_neighbor=use_neighbor,
                     device=device,
-                    save_dir=m["ckpt_dir"],
+                    save_dir=save_dir,
                     ckpt_path=ckpt_path if m["use_backbone"] else None,
                 )
 
@@ -388,48 +540,74 @@ def run_ablation_eval(
 
 # ── visualization ─────────────────────────────────────────────────────────────
 
+def _load_head_for_viz(
+    method:    dict,
+    fold:      int,
+    head_type: str,
+    cfg:       Config,
+    gene_names: list[str],
+    device:    torch.device,
+) -> tuple[object, np.ndarray]:
+    """Load fold checkpoint and return (head, per_gene_pcc)."""
+    save_dir = _ckpt_dir(method["name"], head_type)
+
+    if head_type == "ridge":
+        ckpt_path = save_dir / f"fold_{fold}_ridge.npy"
+        saved     = np.load(ckpt_path, allow_pickle=True).item()
+        head      = RidgeWrapper(saved["coef"], saved["intercept"], device)
+        per_gene  = np.array(saved["per_gene_pcc"])
+    else:
+        ckpt_path = save_dir / f"fold_{fold}_best.pt"
+        saved     = torch.load(ckpt_path, map_location=device, weights_only=False)
+        in_dim    = cfg.uni_dim if method["mode"] == "uni_only" else cfg.hidden_dim + cfg.uni_dim
+        head      = MLPGeneHead(
+            in_dim=in_dim, hidden_dim=HEAD_HIDDEN_DIM,
+            out_dim=len(gene_names), dropout=0.0,
+        ).to(device)
+        head.load_state_dict(saved["head"])
+        head.eval()
+        per_gene  = np.array(saved["per_gene_pcc"])
+
+    return head, per_gene
+
+
 def run_ablation_viz(
     gene_names:  list[str],
     backbone:    Optional[SummaryTableModel],
     cfg:         Config,
     device:      torch.device,
     ckpt_epoch:  int,
+    head_type:   str,
     n_top:       int,
 ) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    sample_list = list(SAMPLE_IDS)
 
-    for fold, val_id in enumerate(sample_list):
+    for fold, val_id in enumerate(SAMPLE_IDS):
         print(f"\nFold {fold} | val={val_id}")
 
-        # Load both fold checkpoints
-        method_heads: dict[str, MLPGeneHead] = {}
+        method_heads: dict[str, object]      = {}
         method_pcc:   dict[str, np.ndarray]  = {}
-
         all_loaded = True
+
         for m in METHODS:
-            fold_ckpt_path = m["ckpt_dir"] / f"fold_{fold}_best.pt"
-            if not fold_ckpt_path.exists():
-                print(f"  [skip] missing {fold_ckpt_path}")
+            save_dir = _ckpt_dir(m["name"], head_type)
+            fold_ckpt = (
+                save_dir / f"fold_{fold}_ridge.npy"
+                if head_type == "ridge"
+                else save_dir / f"fold_{fold}_best.pt"
+            )
+            if not fold_ckpt.exists():
+                print(f"  [skip] missing {fold_ckpt}")
                 all_loaded = False
                 break
 
-            saved      = torch.load(fold_ckpt_path, map_location=device, weights_only=False)
-            in_dim     = cfg.uni_dim if m["mode"] == "uni_only" else cfg.hidden_dim + cfg.uni_dim
-            head       = MLPGeneHead(
-                in_dim=in_dim, hidden_dim=HEAD_HIDDEN_DIM,
-                out_dim=len(gene_names), dropout=0.0,
-            ).to(device)
-            head.load_state_dict(saved["head"])
-            head.eval()
-
-            method_heads[m["name"]] = head
-            method_pcc[m["name"]]   = np.array(saved["per_gene_pcc"])
+            head, per_gene           = _load_head_for_viz(m, fold, head_type, cfg, gene_names, device)
+            method_heads[m["name"]]  = head
+            method_pcc[m["name"]]    = per_gene
 
         if not all_loaded:
             continue
 
-        # Single dataset for all methods (same spots)
         dataset = HestRadiomicsDataset(
             sources=[(EVAL_DATA_ROOT, [val_id])],
             gene_names=gene_names,
@@ -447,7 +625,7 @@ def run_ablation_viz(
         uni_z  = zscore(pred_uni)
         star_z = zscore(pred_star)
 
-        save_path = OUT_DIR / f"{val_id}_ep{ckpt_epoch:03d}_ablation.png"
+        save_path = OUT_DIR / f"{val_id}_ep{ckpt_epoch:03d}_{head_type}_ablation.png"
         plot_ablation_sample(
             sample_id=val_id,
             coords=coords,
@@ -458,6 +636,7 @@ def run_ablation_viz(
             pcc_star=method_pcc["starn"],
             gene_names=gene_names,
             ckpt_epoch=ckpt_epoch,
+            head_type=head_type,
             n_top=n_top,
             save_path=save_path,
         )
@@ -467,18 +646,18 @@ def run_ablation_viz(
 
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="STaRN ablation: UNI-only vs STaRN")
-    p.add_argument(
-        "--ckpt", type=Path, default=None,
-        help="Pretrained STaRN backbone checkpoint (required unless --skip-eval "
-             "and fusion checkpoints already exist).",
-    )
-    p.add_argument("--top-k",     type=int,  default=5,
+    p.add_argument("--ckpt",        type=Path,  default=None,
+                   help="Pretrained STaRN backbone checkpoint.")
+    p.add_argument("--head",        choices=["mlp", "ridge"], default="ridge",
+                   help="Prediction head: mlp (Adam-trained) or ridge (default: ridge).")
+    p.add_argument("--ridge-alpha", type=float, default=1.0,
+                   help="Regularisation strength for Ridge regression (default 1.0).")
+    p.add_argument("--top-k",       type=int,   default=5,
                    help="Genes per section in visualization (default 5).")
-    p.add_argument("--skip-eval", action="store_true",
-                   help="Skip LOOCV training if per-fold checkpoints already exist.")
-    p.add_argument("--viz-only",  action="store_true",
-                   help="Skip LOOCV entirely and jump straight to visualization "
-                        "(all fold checkpoints must exist).")
+    p.add_argument("--skip-eval",   action="store_true",
+                   help="Skip LOOCV if per-fold checkpoints already exist.")
+    p.add_argument("--viz-only",    action="store_true",
+                   help="Skip LOOCV, jump straight to visualization.")
     return p.parse_args()
 
 
@@ -489,12 +668,11 @@ def main():
 
     _patch_dataset_no_img()
 
-    # Gene names — derived from data, not stored
     st_paths   = [EVAL_DATA_ROOT / "st" / f"{sid}.h5ad" for sid in SAMPLE_IDS]
     gene_names = get_common_genes(st_paths, k=N_GENES, criteria=GENE_CRITERIA)
     print(f"Selected {len(gene_names)} common genes.")
 
-    # Backbone (needed for STaRN method)
+    # Backbone
     backbone:   Optional[SummaryTableModel] = None
     ckpt_epoch: int = -1
 
@@ -502,61 +680,56 @@ def main():
         backbone, ckpt_epoch = build_backbone(cfg, args.ckpt, device)
         print(f"Backbone loaded: {args.ckpt}  (epoch {ckpt_epoch})")
     else:
-        # Try to infer ckpt_epoch from existing starn checkpoints for viz titles
-        starn_ckpt_dir = METHODS[1]["ckpt_dir"]
-        for fold_ckpt in starn_ckpt_dir.glob("fold_*_best.pt"):
-            try:
-                saved = torch.load(fold_ckpt, map_location="cpu", weights_only=False)
-                raw = saved.get("backbone_ckpt", None)
-                if raw and Path(raw).exists():
-                    ck = torch.load(raw, map_location="cpu")
-                    ckpt_epoch = int(ck.get("epoch", -1))
+        # Try to recover epoch from existing starn checkpoint
+        starn_dir = _ckpt_dir("starn", args.head)
+        suffix = "ridge.npy" if args.head == "ridge" else "best.pt"
+        for i in range(len(SAMPLE_IDS)):
+            p = starn_dir / f"fold_{i}_{suffix}"
+            if p.exists():
+                try:
+                    if args.head == "ridge":
+                        saved = np.load(p, allow_pickle=True).item()
+                    else:
+                        saved = torch.load(p, map_location="cpu", weights_only=False)
+                    ref = saved.get("backbone_ckpt")
+                    if ref and Path(ref).exists():
+                        backbone, ckpt_epoch = build_backbone(cfg, Path(ref), device)
+                        print(f"Backbone rebuilt from {ref}  (epoch {ckpt_epoch})")
+                except Exception:
+                    pass
                 break
-            except Exception:
-                pass
+
+    # Guard: backbone needed for STaRN training
+    if not args.viz_only and not args.skip_eval and backbone is None:
+        starn_dir = _ckpt_dir("starn", args.head)
+        suffix    = "ridge.npy" if args.head == "ridge" else "best.pt"
+        starn_ok  = all(
+            (starn_dir / f"fold_{i}_{suffix}").exists()
+            for i in range(len(SAMPLE_IDS))
+        )
+        if not starn_ok:
+            raise SystemExit(
+                "--ckpt is required to run STaRN evaluation.\n"
+                "Use --skip-eval if STaRN checkpoints already exist."
+            )
 
     # ── eval ────────────────────────────────────────────────────────────────
     if not args.viz_only:
-        if backbone is None and not (args.skip_eval):
-            # Check whether starn fold checkpoints already exist
-            starn_dir = METHODS[1]["ckpt_dir"]
-            starn_exists = all(
-                (starn_dir / f"fold_{i}_best.pt").exists()
-                for i in range(len(SAMPLE_IDS))
-            )
-            if not starn_exists:
-                raise SystemExit(
-                    "--ckpt is required to run STaRN LOOCV training.\n"
-                    "Use --skip-eval if STaRN checkpoints already exist, or "
-                    "provide --ckpt path."
-                )
-
         method_results, method_pergene = run_ablation_eval(
             gene_names=gene_names,
             backbone=backbone,
             cfg=cfg,
             device=device,
             ckpt_path=args.ckpt,
-            skip_eval=args.skip_eval or args.viz_only,
+            head_type=args.head,
+            ridge_alpha=args.ridge_alpha,
+            skip_eval=args.skip_eval,
         )
-        print_comparison_table(method_results, gene_names, method_pergene)
+        print_comparison_table(method_results, gene_names, method_pergene, args.head)
 
     # ── viz ─────────────────────────────────────────────────────────────────
     if backbone is None:
-        # Rebuild backbone for viz from stored backbone_ckpt ref in checkpoint
-        starn_dir = METHODS[1]["ckpt_dir"]
-        for i in range(len(SAMPLE_IDS)):
-            p = starn_dir / f"fold_{i}_best.pt"
-            if p.exists():
-                saved = torch.load(p, map_location="cpu", weights_only=False)
-                ref   = saved.get("backbone_ckpt")
-                if ref and Path(ref).exists():
-                    backbone, ckpt_epoch = build_backbone(cfg, Path(ref), device)
-                    print(f"Backbone rebuilt from {ref}  (epoch {ckpt_epoch})")
-                    break
-
-    if backbone is None:
-        print("\n[warn] No backbone available — skipping visualization for STaRN method.")
+        print("\n[warn] No backbone available — skipping STaRN visualization.")
         return
 
     print(f"\nGenerating ablation visualizations → {OUT_DIR}/")
@@ -566,6 +739,7 @@ def main():
         cfg=cfg,
         device=device,
         ckpt_epoch=ckpt_epoch,
+        head_type=args.head,
         n_top=args.top_k,
     )
     print(f"\nDone — figures in {OUT_DIR}/")
