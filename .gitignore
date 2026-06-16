@@ -220,3 +220,6 @@ __marimo__/
 # ckpt 
 checkpoints/
 *.pt 
+
+# outpus
+figures/ 
