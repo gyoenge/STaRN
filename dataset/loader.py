@@ -402,9 +402,9 @@ class InductiveBatchSampler(Sampler):
         seed: int = 42,
     ):
         n_context = 1 + n_neighbors + n_semantic
-        if batch_size <= n_context:
+        if batch_size < n_context:
             raise ValueError(
-                f"batch_size ({batch_size}) must be > 1 + n_neighbors + n_semantic ({n_context})"
+                f"batch_size ({batch_size}) must be >= 1 + n_neighbors + n_semantic ({n_context})"
             )
         self.dataset     = dataset
         self.batch_size  = batch_size
@@ -553,8 +553,9 @@ class InductiveBatchSampler(Sampler):
             else:
                 semantic = []
 
-            # -- random globals --
-            globals_idx = rng.choice(n_total, self.n_globals, replace=False).tolist()
+            # -- random globals (omitted when n_globals == 0, e.g. inference-only mode) --
+            globals_idx = rng.choice(n_total, self.n_globals, replace=False).tolist() \
+                if self.n_globals > 0 else []
 
             yield [anchor] + spatial + semantic + globals_idx
 

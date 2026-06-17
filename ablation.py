@@ -154,15 +154,17 @@ def extract_features_neighbor(
     dataset:  HestRadiomicsDataset,
     device:   torch.device,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract features using InductiveBatchSampler; collect anchor (index 0) only.
+    """Extract neighbor-aware anchor features via InductiveBatchSampler (no globals).
 
-    Row attention sees the anchor's true spatial kNN + semantic kNN neighbours,
-    exactly mirroring the conditions used during backbone training and eval.py.
+    Feature per anchor:
+        concat(z_anchor, mean(z_spatial[N_NEIGHBORS]), mean(z_semantic[N_SEMANTIC]), uni_anchor)
+    dim: (2 + int(N_SEMANTIC>0)) * hidden_dim + uni_dim  =  1408
+
     Returns (feats, targets, coords) each float32, one row per spot.
     """
     loader = build_loader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=1 + N_NEIGHBORS + N_SEMANTIC,   # no random globals at inference
         n_neighbors=N_NEIGHBORS,
         n_semantic=N_SEMANTIC,
         num_workers=NUM_WORKERS,
@@ -175,11 +177,18 @@ def extract_features_neighbor(
         uni_emb = batch["uni_emb"].to(device)
         coord   = batch["coord"]
 
-        z    = backbone.encode(rad, coord.to(device))   # (B, hidden_dim)
-        feat = torch.cat([z, uni_emb], dim=-1)           # (B, hidden+uni)
+        z = backbone.encode(rad, coord.to(device))             # (B, D)
 
-        # anchor only
-        feats_l.append(feat[0:1].cpu().numpy())
+        z_anchor  = z[0:1]                                     # (1, D)
+        z_spatial = z[1:1+N_NEIGHBORS].mean(0, keepdim=True)  # (1, D)
+        parts = [z_anchor, z_spatial]
+        if N_SEMANTIC > 0:
+            z_semantic = z[1+N_NEIGHBORS:1+N_NEIGHBORS+N_SEMANTIC].mean(0, keepdim=True)
+            parts.append(z_semantic)
+        parts.append(uni_emb[0:1])
+        feat = torch.cat(parts, dim=-1)                        # (1, feat_dim)
+
+        feats_l.append(feat.cpu().numpy())
         targets_l.append(batch["st"][0:1].numpy())
         coords_l.append(coord[0:1].numpy())
 
@@ -312,7 +321,7 @@ def infer_method(
     if method["neighbor_batch"]:
         loader = build_loader(
             dataset,
-            batch_size=BATCH_SIZE,
+            batch_size=1 + N_NEIGHBORS + N_SEMANTIC,   # no random globals at inference
             n_neighbors=N_NEIGHBORS,
             n_semantic=N_SEMANTIC,
             num_workers=NUM_WORKERS,
@@ -338,8 +347,19 @@ def infer_method(
         gt      = batch["st"]
 
         if method["use_backbone"] and backbone is not None:
-            z    = backbone.encode(rad, coord.to(device))
-            feat = torch.cat([z, uni_emb], dim=-1)
+            z = backbone.encode(rad, coord.to(device))           # (B, D)
+            if anchor_only:
+                # Neighbor-aware anchor feature (same as extract_features_neighbor)
+                z_anchor  = z[0:1]
+                z_spatial = z[1:1+N_NEIGHBORS].mean(0, keepdim=True)
+                parts = [z_anchor, z_spatial]
+                if N_SEMANTIC > 0:
+                    z_semantic = z[1+N_NEIGHBORS:1+N_NEIGHBORS+N_SEMANTIC].mean(0, keepdim=True)
+                    parts.append(z_semantic)
+                parts.append(uni_emb[0:1])
+                feat = torch.cat(parts, dim=-1)
+            else:
+                feat = torch.cat([z, uni_emb], dim=-1)
         else:
             feat = uni_emb
 
@@ -348,7 +368,9 @@ def infer_method(
             pred = pred.cpu()
 
         if anchor_only:
-            coord, gt, pred = coord[0:1], gt[0:1], pred[0:1]
+            coord, gt = coord[0:1], gt[0:1]
+            if isinstance(pred, torch.Tensor) and pred.shape[0] > 1:
+                pred = pred[0:1]
 
         coords_l.append(coord.numpy())
         gt_l.append(gt.numpy() if isinstance(gt, torch.Tensor) else gt)
@@ -615,7 +637,12 @@ def _load_head_for_viz(
         per_gene = np.array(saved["per_gene_pcc"])
     else:
         saved   = torch.load(ckpt_path, map_location=device, weights_only=False)
-        in_dim  = cfg.uni_dim if not method["use_backbone"] else cfg.hidden_dim + cfg.uni_dim
+        if not method["use_backbone"]:
+            in_dim = cfg.uni_dim
+        elif method["neighbor_batch"]:
+            in_dim = (2 + (1 if N_SEMANTIC > 0 else 0)) * cfg.hidden_dim + cfg.uni_dim
+        else:
+            in_dim = cfg.hidden_dim + cfg.uni_dim
         head    = MLPGeneHead(
             in_dim=in_dim, hidden_dim=HEAD_HIDDEN_DIM,
             out_dim=len(gene_names), dropout=0.0,

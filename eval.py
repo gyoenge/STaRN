@@ -232,14 +232,14 @@ def _extract_features(
     device:      torch.device,
     use_neighbor: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract (features, st, mask) from a batch.
+    """Extract (features, st, n_eval) from a batch.
 
-    Returns:
-        feat:   (N, feat_dim) — features for gene head input
-        st:     (N, n_genes)  — gene expression targets
-        n_eval: number of spots to collect predictions for:
-                  - use_neighbor: 1 (anchor only, index 0)
-                  - plain loader: full batch B
+    fusion + use_neighbor=True  — neighbor-aware anchor feature:
+        concat(z_anchor, mean(z_spatial), mean(z_semantic), uni_anchor)
+        Returns only the anchor row; each train/eval step processes 1 spot.
+
+    fusion + use_neighbor=False — plain concat(z, uni) for the full batch.
+    tab_only / uni_only         — unchanged.
     """
     rad     = batch["radiomics"].to(device)
     uni_emb = batch["uni_emb"].to(device)
@@ -249,16 +249,28 @@ def _extract_features(
     if mode == "uni_only":
         return uni_emb, st, rad.size(0)
 
-    # backbone.encode receives full batch so row attention sees neighbour context
     with torch.no_grad():
         z = backbone.encode(rad, coords)   # (B, hidden_dim)
 
     if mode == "tab_only":
-        feat = z
-    else:  # fusion
-        feat = torch.cat([z, uni_emb], dim=-1)
+        return z, st, rad.size(0)
 
-    return feat, st, rad.size(0)
+    # fusion
+    if use_neighbor:
+        # Neighbor-aware anchor feature — batch layout:
+        # [anchor | N_NEIGHBORS spatial-kNN | N_SEMANTIC semantic-kNN | globals]
+        z_anchor  = z[0:1]                                               # (1, D)
+        z_spatial = z[1 : 1 + N_NEIGHBORS].mean(0, keepdim=True)        # (1, D)
+        parts = [z_anchor, z_spatial]
+        if N_SEMANTIC > 0:
+            z_semantic = z[1 + N_NEIGHBORS : 1 + N_NEIGHBORS + N_SEMANTIC].mean(0, keepdim=True)
+            parts.append(z_semantic)
+        parts.append(uni_emb[0:1])
+        feat = torch.cat(parts, dim=-1)                                  # (1, feat_dim)
+        return feat, st[0:1], 1
+    else:
+        feat = torch.cat([z, uni_emb], dim=-1)
+        return feat, st, rad.size(0)
 
 
 # ── evaluate ──────────────────────────────────────────────────────────────────
@@ -288,10 +300,11 @@ def evaluate(
 
         pred = head(feat)
 
-        if use_neighbor and mode != "uni_only":
-            # anchor only — row attention already consumed the full batch
+        if use_neighbor and mode == "tab_only":
+            # tab_only still returns full batch; slice to anchor here
             pred = pred[:1]
             st   = st[:1]
+        # fusion+use_neighbor already returns anchor-only from _extract_features
 
         all_preds.append(pred.cpu())
         all_targets.append(st.cpu())
@@ -326,13 +339,18 @@ def run_fold(
     val_loader   = make_loader([val_id],  gene_names, cfg, use_neighbor, shuffle=False)
     print(f"  train spots: {len(train_loader.dataset)}  val spots: {len(val_loader.dataset)}")
 
-    # Input dimension depends on mode
+    # Input dimension depends on mode and whether neighbor context is used
     if mode == "uni_only":
         in_dim = cfg.uni_dim
     elif mode == "tab_only":
         in_dim = cfg.hidden_dim
     else:  # fusion
-        in_dim = cfg.hidden_dim + cfg.uni_dim
+        if use_neighbor:
+            # concat(z_anchor, z_spatial, [z_semantic,] uni_anchor)
+            n_parts = 2 + (1 if N_SEMANTIC > 0 else 0)
+            in_dim = n_parts * cfg.hidden_dim + cfg.uni_dim
+        else:
+            in_dim = cfg.hidden_dim + cfg.uni_dim
 
     head = MLPGeneHead(
         in_dim=in_dim,
