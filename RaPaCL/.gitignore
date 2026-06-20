@@ -206,20 +206,53 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-###
 
-# test
-.test 
+####
+.env 
 
-# note
-.note 
+# checkpoints
+./*/checkpoints/
+./*/checkpoints/*
+*.pth
 
-# claude 
-.claude 
+# logs
+logs/
+logs/*
+*/logs/
+*/logs/*
+*.log 
 
-# ckpt 
+# results
+outputs/
+outputs/*
+*/outputs/
+*/outputs/*
+*.csv 
+selected_results/
+selected_results/*
+*/selected_results/
+*/selected_results/* 
+src/rapacl/output/
+
+# generated configs 
+src/*/generated/
+src/*/generated/*
+src/*/img2rad-*.yaml
+src/*/configs/generated/
+src/*/configs/generated/*
+!configs/generated/.gitkeep
+
+# generated transtab tokenizer folder
+transtab/tokenizer/
+transtab/tokenizer/* 
+
+# test notebook
+src/pretrain_transtab/transtab_custom/test.ipynb
+*/test.ipynb
+
+
+# checkpoints 
+src/radtranstab/checkpoints/
+src/rapacl/checkpoints/
+*/checkpoints/
 checkpoints/
-*.pt 
-
-# outpus
-figures/ 

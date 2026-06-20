@@ -39,6 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
@@ -55,12 +56,16 @@ from eval import (
     MLPGeneHead,
     compute_genewise_pcc,
     run_fold,
+    make_loader,
+    _extract_features,
+    evaluate,
     EVAL_DATA_ROOT,
     SAMPLE_IDS,
     N_GENES,
     GENE_CRITERIA,
     HEAD_HIDDEN_DIM,
     HEAD_DROPOUT,
+    HEAD_WEIGHT_DECAY,
     NUM_WORKERS,
     BATCH_SIZE,
     N_NEIGHBORS,
@@ -97,8 +102,9 @@ CMAP        = "RdBu_r"
 VMIN, VMAX  = -2.0, 2.0
 
 
-def _ckpt_dir(method_name: str, head: str) -> Path:
-    return Path(f"checkpoints/loocv_{method_name}_{head}")
+def _ckpt_dir(method_name: str, head: str, n_genes: int = 250) -> Path:
+    suffix = f"_hvg{n_genes}" if n_genes != 250 else ""
+    return Path(f"checkpoints/loocv_{method_name}_{head}{suffix}")
 
 
 # ── feature extraction ────────────────────────────────────────────────────────
@@ -217,13 +223,29 @@ def zscore(X: np.ndarray) -> np.ndarray:
 # ── Ridge head ────────────────────────────────────────────────────────────────
 
 class RidgeWrapper:
-    """Torch-compatible wrapper around a fitted Ridge model for use in infer_method."""
+    """Torch-compatible wrapper around a fitted Ridge model for use in infer_method.
 
-    def __init__(self, coef: np.ndarray, intercept: np.ndarray, device: torch.device):
+    Optionally holds a fitted sklearn Pipeline (StandardScaler + PCA) that is
+    applied before the linear forward pass — matching the HEST-bench protocol.
+    """
+
+    def __init__(
+        self,
+        coef:      np.ndarray,
+        intercept: np.ndarray,
+        device:    torch.device,
+        pipeline=None,   # fitted sklearn Pipeline or None
+    ):
         self.coef      = torch.tensor(coef,      dtype=torch.float32, device=device)
         self.intercept = torch.tensor(intercept, dtype=torch.float32, device=device)
+        self.pipeline  = pipeline
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pipeline is not None:
+            x = torch.tensor(
+                self.pipeline.transform(x.cpu().numpy()),
+                dtype=torch.float32, device=self.coef.device,
+            )
         return x @ self.coef.T + self.intercept
 
     def eval(self) -> "RidgeWrapper":
@@ -237,6 +259,136 @@ class RidgeWrapper:
 
 # ── Ridge LOOCV fold ──────────────────────────────────────────────────────────
 
+HEST_PCA_DIM = 256   # HEST-bench default latent_dim
+
+# ── MLP hyperparameter search ─────────────────────────────────────────────────
+
+MLP_LR_GRID    = [1e-3, 3e-4, 1e-4, 3e-5]
+MLP_MAX_EPOCHS = 50
+MLP_PATIENCE   = 10
+
+
+def run_mlp_fold_hparam(
+    fold:       int,
+    val_id:     str,
+    train_ids:  list[str],
+    gene_names: list[str],
+    method:     dict,
+    backbone:   Optional[SummaryTableModel],
+    cfg:        Config,
+    device:     torch.device,
+    save_dir:   Path,
+    ckpt_path:  Optional[Path],
+    n_genes:    int = 250,
+) -> tuple[float, np.ndarray]:
+    """MLP fold training with LR grid search + early stopping.
+
+    For each lr in MLP_LR_GRID, trains for up to MLP_MAX_EPOCHS with
+    patience-based early stopping.  Saves the best (lr, epoch) checkpoint.
+    """
+    from copy import deepcopy
+
+    mode         = "uni_only" if not method["use_backbone"] else "fusion"
+    use_neighbor = method["neighbor_batch"]
+
+    if not method["use_backbone"]:
+        in_dim = cfg.uni_dim
+    elif method["neighbor_batch"]:
+        in_dim = (2 + (1 if N_SEMANTIC > 0 else 0)) * cfg.hidden_dim + cfg.uni_dim
+    else:
+        in_dim = cfg.hidden_dim + cfg.uni_dim
+
+    print(f"\n{'─' * 60}")
+    print(f"Fold {fold}  val={val_id}  train={train_ids}")
+
+    train_loader = make_loader(train_ids, gene_names, cfg, use_neighbor, shuffle=True)
+    val_loader   = make_loader([val_id],  gene_names, cfg, use_neighbor, shuffle=False)
+    print(f"  train spots: {len(train_loader.dataset)}  val spots: {len(val_loader.dataset)}")
+    print(f"  in_dim={in_dim}  LR grid={MLP_LR_GRID}  max_epochs={MLP_MAX_EPOCHS}  patience={MLP_PATIENCE}")
+
+    criterion = nn.MSELoss()
+
+    best_global_pcc      = -1.0
+    best_global_per_gene = None
+    best_lr_found        = None
+    best_epoch_found     = -1
+    best_state_dict      = None
+
+    for lr in MLP_LR_GRID:
+        head = MLPGeneHead(
+            in_dim=in_dim, hidden_dim=HEAD_HIDDEN_DIM,
+            out_dim=len(gene_names), dropout=HEAD_DROPOUT,
+        ).to(device)
+        optimizer = torch.optim.AdamW(
+            head.parameters(), lr=lr, weight_decay=HEAD_WEIGHT_DECAY
+        )
+
+        best_pcc_lr      = -1.0
+        best_state_lr    = None
+        best_epoch_lr    = -1
+        best_per_gene_lr = None
+        no_improve       = 0
+
+        for epoch in range(MLP_MAX_EPOCHS):
+            if hasattr(train_loader, "batch_sampler") and hasattr(
+                train_loader.batch_sampler, "set_epoch"
+            ):
+                train_loader.batch_sampler.set_epoch(epoch)
+
+            head.train()
+            for batch in train_loader:
+                feat, st, _ = _extract_features(batch, backbone, mode, device, use_neighbor)
+                loss = criterion(head(feat), st)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            _, val_pcc, per_gene = evaluate(head, val_loader, backbone, mode, device, use_neighbor)
+
+            if val_pcc > best_pcc_lr:
+                best_pcc_lr      = val_pcc
+                best_state_lr    = deepcopy(head.state_dict())
+                best_epoch_lr    = epoch
+                best_per_gene_lr = per_gene
+                no_improve       = 0
+            else:
+                no_improve += 1
+                if no_improve >= MLP_PATIENCE:
+                    break
+
+        print(f"  lr={lr:.0e}  best_pcc={best_pcc_lr:.4f}  best_epoch={best_epoch_lr}  "
+              f"(stopped at epoch {epoch})")
+
+        if best_pcc_lr > best_global_pcc:
+            best_global_pcc      = best_pcc_lr
+            best_global_per_gene = best_per_gene_lr
+            best_lr_found        = lr
+            best_epoch_found     = best_epoch_lr
+            best_state_dict      = best_state_lr
+
+    print(f"  → best PCC={best_global_pcc:.4f}  lr={best_lr_found:.0e}  epoch={best_epoch_found}")
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "fold":             fold,
+            "epoch":            best_epoch_found,
+            "lr":               best_lr_found,
+            "head":             best_state_dict,
+            "val_genewise_pcc": best_global_pcc,
+            "per_gene_pcc":     best_global_per_gene,
+            "gene_names":       gene_names,
+            "val_id":           val_id,
+            "train_ids":        train_ids,
+            "mode":             mode,
+            "use_neighbor":     use_neighbor,
+            "backbone_ckpt":    str(ckpt_path) if ckpt_path else None,
+        },
+        save_dir / f"fold_{fold}_best.pt",
+    )
+    return best_global_pcc, best_global_per_gene
+
+
 def run_ridge_fold(
     fold:       int,
     val_id:     str,
@@ -245,10 +397,14 @@ def run_ridge_fold(
     method:     dict,
     backbone:   Optional[SummaryTableModel],
     device:     torch.device,
-    alpha:      float,
+    alpha:      float,   # kept for API compat; overridden by HEST adaptive formula
     save_dir:   Path,
+    n_genes:    int = 250,
 ) -> tuple[float, np.ndarray]:
+    from sklearn.decomposition import PCA
     from sklearn.linear_model import Ridge
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
 
     print(f"\n{'─' * 60}")
     print(f"Fold {fold}  val={val_id}  train={train_ids}")
@@ -269,15 +425,33 @@ def run_ridge_fold(
     X_val, y_val, _ = dispatch_extract(method, backbone, val_ds, device)
     print(f"done  {X_val.shape}")
 
-    print(f"  fitting Ridge(alpha={alpha})...", end=" ", flush=True)
+    # HEST-bench preprocessing: StandardScaler → PCA(256)
+    pca_dim = min(HEST_PCA_DIM, X_tr.shape[0] - 1, X_tr.shape[1])
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca",    PCA(n_components=pca_dim, random_state=0)),
+    ])
+    X_tr_t  = pipe.fit_transform(X_tr)
+    X_val_t = pipe.transform(X_val)
+    print(f"  PCA: {X_tr.shape[1]}→{pca_dim}")
+
+    # HEST-bench adaptive alpha: 100 / (n_features * n_genes)
+    hest_alpha = 100.0 / (X_tr_t.shape[1] * y_tr.shape[1])
+    print(f"  Ridge alpha={hest_alpha:.6f} (HEST adaptive)  fit_intercept=False  solver=lsqr")
+
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = Ridge(alpha=alpha, fit_intercept=True)
-        model.fit(X_tr, y_tr)
-    print("done")
+        model = Ridge(
+            alpha=hest_alpha,
+            fit_intercept=False,
+            solver="lsqr",
+            random_state=0,
+            max_iter=1000,
+        )
+        model.fit(X_tr_t, y_tr)
 
-    pred_val    = model.predict(X_val).astype(np.float32)
+    pred_val    = model.predict(X_val_t).astype(np.float32)
     mean_pcc, per_gene = compute_genewise_pcc(
         torch.from_numpy(pred_val), torch.from_numpy(y_val)
     )
@@ -293,10 +467,11 @@ def run_ridge_fold(
             "train_ids":        train_ids,
             "gene_names":       gene_names,
             "coef":             model.coef_.astype(np.float32),
-            "intercept":        model.intercept_.astype(np.float32),
+            "intercept":        np.atleast_1d(model.intercept_).astype(np.float32),
+            "pipeline":         pipe,
             "per_gene_pcc":     per_gene.astype(np.float32),
             "val_genewise_pcc": float(mean_pcc),
-            "alpha":            alpha,
+            "alpha":            hest_alpha,
         },
         allow_pickle=True,
     )
@@ -571,6 +746,7 @@ def run_ablation_eval(
     head_type:   str,
     ridge_alpha: float,
     skip_eval:   bool,
+    n_genes:     int = 250,
 ) -> tuple[dict[str, list[float]], dict[str, list[np.ndarray]]]:
     sample_list   = list(SAMPLE_IDS)
     method_results: dict[str, list[float]]      = {m["name"]: [] for m in METHODS}
@@ -582,7 +758,7 @@ def run_ablation_eval(
         print(f"{'#' * 60}")
 
         backbone_m = backbone if m["use_backbone"] else None
-        save_dir   = _ckpt_dir(m["name"], head_type)
+        save_dir   = _ckpt_dir(m["name"], head_type, n_genes)
         fold_suffix = "ridge.npy" if head_type == "ridge" else "best.pt"
 
         for fold, val_id in enumerate(sample_list):
@@ -597,17 +773,16 @@ def run_ablation_eval(
                     fold=fold, val_id=val_id, train_ids=train_ids,
                     gene_names=gene_names, method=m, backbone=backbone_m,
                     device=device, alpha=ridge_alpha, save_dir=save_dir,
+                    n_genes=n_genes,
                 )
             else:
-                # MLP via eval.py's run_fold
-                use_neighbor = m["neighbor_batch"]
-                best_pcc, per_gene = run_fold(
+                # MLP with per-fold LR grid search + early stopping
+                best_pcc, per_gene = run_mlp_fold_hparam(
                     fold=fold, val_id=val_id, train_ids=train_ids,
-                    gene_names=gene_names, backbone=backbone_m, cfg=cfg,
-                    mode="uni_only" if not m["use_backbone"] else "fusion",
-                    use_neighbor=use_neighbor, device=device,
-                    save_dir=save_dir,
+                    gene_names=gene_names, method=m, backbone=backbone_m,
+                    cfg=cfg, device=device, save_dir=save_dir,
                     ckpt_path=ckpt_path if m["use_backbone"] else None,
+                    n_genes=n_genes,
                 )
 
             method_results[m["name"]].append(best_pcc)
@@ -626,14 +801,16 @@ def _load_head_for_viz(
     gene_names: list[str],
     cfg:        Config,
     device:     torch.device,
+    n_genes:    int = 250,
 ) -> tuple[object, np.ndarray]:
-    save_dir    = _ckpt_dir(method["name"], head_type)
+    save_dir    = _ckpt_dir(method["name"], head_type, n_genes)
     fold_suffix = "ridge.npy" if head_type == "ridge" else "best.pt"
     ckpt_path   = save_dir / f"fold_{fold}_{fold_suffix}"
 
     if head_type == "ridge":
         saved    = np.load(ckpt_path, allow_pickle=True).item()
-        head     = RidgeWrapper(saved["coef"], saved["intercept"], device)
+        head     = RidgeWrapper(saved["coef"], saved["intercept"], device,
+                                pipeline=saved.get("pipeline"))
         per_gene = np.array(saved["per_gene_pcc"])
     else:
         saved   = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -662,6 +839,7 @@ def run_ablation_viz(
     ckpt_epoch:  int,
     head_type:   str,
     n_top:       int,
+    n_genes:     int = 250,
 ) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -674,12 +852,12 @@ def run_ablation_viz(
 
         for m in METHODS:
             fold_suffix = "ridge.npy" if head_type == "ridge" else "best.pt"
-            ckpt_path   = _ckpt_dir(m["name"], head_type) / f"fold_{fold}_{fold_suffix}"
+            ckpt_path   = _ckpt_dir(m["name"], head_type, n_genes) / f"fold_{fold}_{fold_suffix}"
             if not ckpt_path.exists():
                 print(f"  [skip] missing {ckpt_path}")
                 ok = False
                 break
-            head, per_gene = _load_head_for_viz(m, fold, head_type, gene_names, cfg, device)
+            head, per_gene = _load_head_for_viz(m, fold, head_type, gene_names, cfg, device, n_genes)
             heads[m["name"]] = head
             pccs[m["name"]]  = per_gene
 
@@ -701,7 +879,8 @@ def run_ablation_viz(
             _, _, pred = infer_method(m, bb, heads[m["name"]], dataset, device)
             pred_zs[m["name"]] = zscore(pred)
 
-        save_path = OUT_DIR / f"{val_id}_ep{ckpt_epoch:03d}_{head_type}_ablation.png"
+        hvg_tag   = f"_hvg{n_genes}" if n_genes != 250 else ""
+        save_path = OUT_DIR / f"{val_id}_ep{ckpt_epoch:03d}_{head_type}{hvg_tag}_ablation.png"
         plot_ablation_sample(
             sample_id=val_id,
             coords=coords,
@@ -723,6 +902,7 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--ckpt",        type=Path,  default=None)
     p.add_argument("--head",        choices=["mlp", "ridge"], default="ridge")
     p.add_argument("--ridge-alpha", type=float, default=1.0)
+    p.add_argument("--n-genes",     type=int,   default=250)
     p.add_argument("--top-k",       type=int,   default=5)
     p.add_argument("--skip-eval",   action="store_true")
     p.add_argument("--viz-only",    action="store_true")
@@ -737,7 +917,7 @@ def main():
     _patch_dataset_no_img()
 
     st_paths   = [EVAL_DATA_ROOT / "st" / f"{sid}.h5ad" for sid in SAMPLE_IDS]
-    gene_names = get_common_genes(st_paths, k=N_GENES, criteria=GENE_CRITERIA)
+    gene_names = get_common_genes(st_paths, k=args.n_genes, criteria=GENE_CRITERIA)
     print(f"Selected {len(gene_names)} common genes.")
 
     backbone:   Optional[SummaryTableModel] = None
@@ -748,7 +928,7 @@ def main():
         print(f"Backbone loaded: {args.ckpt}  (epoch {ckpt_epoch})")
     else:
         # Try to recover backbone from existing starn_neighbor checkpoint
-        nbr_dir = _ckpt_dir("starn_neighbor", args.head)
+        nbr_dir = _ckpt_dir("starn_neighbor", args.head, args.n_genes)
         suffix  = "ridge.npy" if args.head == "ridge" else "best.pt"
         for i in range(len(SAMPLE_IDS)):
             p = nbr_dir / f"fold_{i}_{suffix}"
@@ -772,6 +952,7 @@ def main():
             gene_names=gene_names, backbone=backbone, cfg=cfg, device=device,
             ckpt_path=args.ckpt, head_type=args.head,
             ridge_alpha=args.ridge_alpha, skip_eval=args.skip_eval,
+            n_genes=args.n_genes,
         )
         print_comparison_table(method_results, gene_names, method_pergene, args.head)
 
@@ -783,6 +964,7 @@ def main():
     run_ablation_viz(
         gene_names=gene_names, backbone=backbone, cfg=cfg, device=device,
         ckpt_epoch=ckpt_epoch, head_type=args.head, n_top=args.top_k,
+        n_genes=args.n_genes,
     )
     print(f"\nDone — figures in {OUT_DIR}/")
 
